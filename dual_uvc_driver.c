@@ -5,8 +5,9 @@
 #include <linux/list.h>
 #include <linux/kref.h>
 #include <linux/device.h>
-#include <linux/unaligned.h>
+#include <linux/unaligned/packed_struct.h>
 #include <linux/usb.h>
+#include <linux/usb/uvc.h>
 #include <linux/usb/video.h>
 #include <linux/mutex.h>
 #include <linux/videodev2.h>
@@ -38,11 +39,56 @@
 #define MAX_VIDEO_FRAME_SIZE (WIDTH * HEIGHT * 2)
 #define FORMAT               V4L2_PIX_FMT_NV12
 
+#define UVC_URBS           5
+
 #define SHARED_POOL_BUFS   8
 #define SHARED_BUF_SIZE   (1920 * 1080 * 2)
 
 #define UVC_CTRL_CONTROL_TIMEOUT	5000
 #define UVC_CTRL_STREAMING_TIMEOUT	5000
+
+#define UVC_FMT_FLAG_COMPRESSED		0x00000001
+/* -------------------------------------------------------------------
+ * DBG printing and logging
+ * ------------------------------------------------------------------- */
+#define EJCM3_DBG_PROBE         (1 << 0)
+#define EJCM3_DBG_DESCR         (1 << 1)
+#define EJCM3_DBG_CONTROL       (1 << 2)
+#define EJCM3_DBG_FORMAT        (1 << 3)
+#define EJCM3_DBG_CAPTURE       (1 << 4)
+#define EJCM3_DBG_CALLS         (1 << 5)
+#define EJCM3_DBG_FRAME         (1 << 7)
+#define EJCM3_DBG_SUSPEND       (1 << 8)
+#define EJCM3_DBG_STATUS        (1 << 9)
+#define EJCM3_DBG_VIDEO         (1 << 10)
+#define EJCM3_DBG_STATS         (1 << 11)
+#define EJCM3_DBG_CLOCK         (1 << 12)
+
+#define UVC_WARN_MINMAX         0
+#define UVC_WARN_PROBE_DEF      1
+#define UVC_WARN_XU_GET_RES     2
+
+unsigned int ejcm3_dbg_param;
+
+#define ejcm3_uvc_dbg(_dev, flag, fmt, ...)				\
+do {									\
+	if (ejcm3_dbg_param & EJCM3_DBG_##flag)				\
+		dev_printk(KERN_DEBUG, &(_dev)->udev->dev, fmt,		\
+			   ##__VA_ARGS__);				\
+} while (0)
+
+#define ejcm3_uvc_dbg_cont(flag, fmt, ...)				\
+do {									\
+	if (ejcm3_dbg_param & EJCM3_DBG_##flag)				\
+		pr_cont(fmt, ##__VA_ARGS__);				\
+} while (0)
+
+#define ejcm3_uvc_warn_once(_dev, warn, fmt, ...)			\
+do {									\
+	if (!test_and_set_bit(warn, &(_dev)->warnings))			\
+		dev_info(&(_dev)->udev->dev, fmt, ##__VA_ARGS__);	\
+} while (0)
+
 
 /* -------------------------------------------------------------------
  * Data structures (buffer & queue)
@@ -85,6 +131,7 @@ struct video_buffer {
 
         /* points to shared mem pool */
         // struct shared_video_mem *mem;
+		void *mem;
         unsigned int length;
         unsigned int byteused;
 
@@ -117,7 +164,7 @@ struct uvc_copy_op {
 
 struct uvc_urb {
         struct urb *urb;
-        struct ejcm3_uvc *ejcm3;
+        struct ejcm3_uvc_streaming *stream;
         char *buffer;
         dma_addr_t dma;
         struct sg_table *sgt;
@@ -130,48 +177,119 @@ struct uvc_urb {
 /* -------------------------------------------------------------------
  * Individual stream node
  * ------------------------------------------------------------------- */
-struct uvc_streaming_node {
+struct ejcm3_streaming_header {
+	u8 bNumFormats;
+	u8 bEndpointAddress;
+	u8 bmInfo;
+	u8 bTerminalLink;
+	u8 bStillCaptureMethod;
+	u8 bTriggerSupport;
+	u8 bTriggerUsage;
+	u8 bControlSize;
+	u8 *bmaControls;
+};
+
+struct ejcm3_uvc_frame {
+	u8 bFrameIndex;
+	u8 bmCapabilities;
+	u16 wWidth;
+	u16 wHeight;
+	u32 dwMinBitRate;
+	u32 dwMaxBitRate;
+	u32 dwMaxVideoFrameBufferSize;
+	u32 dwDefaultFrameInterval;
+	u8 bFrameIntervalType;
+	const u32 *dwFrameInterval;
+};
+
+struct ejcm3_uvc_format {
+	u8 type;
+	u8 index;
+	u8 bpp;
+	enum v4l2_colorspace colorspace;
+	u32 fcc;
+	u32 flags;
+
+	unsigned int nframes;
+	const struct ejcm3_uvc_frame *frames;
+};
+
+struct ejcm3_uvc_streaming {
         struct list_head list;
         struct video_device vdev;
+	atomic_t active;
+
         struct ejcm3_uvc *ejcm3_dev;
         struct usb_interface *intf;
         int intfnum;
 
+	struct ejcm3_streaming_header header;
+	enum v4l2_buf_type type;
+	struct v4l2_prio_state prio;
+
+	unsigned int nformats;
+	const struct ejcm3_uvc_format *formats;
+
         struct uvc_streaming_control ctrl;
+	const struct ejcm3_uvc_format *def_format;
+	const struct ejcm3_uvc_format *cur_format;
+	const struct ejcm3_uvc_frame *cur_frame;
 
-        struct kref kref;
         struct mutex mutex;
-        struct video_queue queue;
 
-        struct uvc_urb uvc_urb[5];
+        struct video_queue queue;
+	struct workqueue_struct *async_wq;
+	void (*decode)(struct uvc_urb *uvc_urb, struct video_buffer);
+
+	struct {
+		u8 header[256];
+		unsigned int header_size;
+		int skip_payload;
+		u32 payload_size;
+		u32 max_payload_size;
+	} bulk;
+        
+	struct uvc_urb uvc_urb[5];
         unsigned int urb_size;
 
-        struct workqueue_struct *async_wq;
-        void (*decode)(struct uvc_urb *uvc_urb, struct video_buffer);
+	u32 sequence;
+	u8 last_fid;
 
         // struct shared_video_pool *pool; //
 };
+
+#define for_each_uvc_urb(uvc_urb, ejcm3_uvc_streaming) \
+	for ((uvc_urb) = &(ejcm3_uvc_streaming)->uvc_urb[0]; \
+	     (uvc_urb) < &(ejcm3_uvc_streaming)->uvc_urb[UVC_URBS]; \
+	     ++(uvc_urb))
+
 
 /* The physical device structure */
 struct ejcm3_uvc {
         struct usb_device *udev;
         struct usb_interface *intf;
+	unsigned long warnings;
         int intfnum;
         char name[32];
+
+	u8 output_TerminalID;
+	u16 output_TerminalType;
+
+	/* Protect users */
+	struct mutex lock;
+	unsigned int users;
+	atomic_t nmappings;
 
         struct v4l2_device v4l2_dev;
         u16 uvc_version;
         u32 clock_frequency;
-        
-        // struct shared_video_pool *pool; //
 
-        unsigned int nformats;
-        const struct uvc_format *formats;
-
+	/* Video streaming interface */
         struct list_head streams;
         struct kref kref;
+
         /* Device manager */
-        struct list_head list;
+        // struct list_head list;
 };
 
 /* -----------------------------------------------------------
@@ -182,7 +300,7 @@ struct stitch_stream_node {
         struct v4l2_device v4l2_dev; // virtual V4L2 parent
         struct video_queue queue;
 
-        struct uvc_streaming_node *slot[2];
+        struct ejcm3_uvc_streaming *slot[2];
         struct mutex lock;
 };
 /* -----------------------------------------------------------
@@ -198,51 +316,67 @@ struct driver_dev_manager {
 
 static struct driver_dev_manager global_mgr;
 
-/* Release source */
-static void stream_release(struct kref *kref) {
-        struct uvc_streaming_node *stream =
-                container_of(kref, struct uvc_streaming_node, kref);
+/* -----------------------------------------------------------
+ * Release source
+ * ----------------------------------------------------------- */
+static void stream_delete(struct ejcm3_uvc_streaming *stream)
+{
+	if (stream->async_wq)
+		destroy_workqueue(stream->async_wq);
 
-        /* safety: stream should already be stopped */
-        if (stream->async_wq) {
-                flush_workqueue(stream->async_wq);
-                destroy_workqueue(stream->async_wq);
-                stream->async_wq = NULL;
-        }
+	mutex_destroy(&stream->mutex);
 
-        /* URBs must be killed before this point */
-        /* (STREAMOFF / disconnect path responsibility) */
+	usb_put_intf(stream->intf);
 
-        if (stream->intf) {
-                usb_put_intf(stream->intf);
-                stream->intf = NULL;
-        }
-
-        /* video_device unregister should already be done */
-        /* video_unregister_device() calls vdev->release() */
-
-        mutex_destroy(&stream->mutex);
-
-        kfree(stream);
+	kfree(stream->formats);
+	kfree(stream->header.bmaControls); //
+	kfree(stream);		
 }
 
-static void ejcm3_uvc_release(struct kref *kref)
+static struct ejcm3_uvc_streaming *stream_new(struct ejcm3_uvc *dev, struct usb_interface *intf)
+{
+        struct ejcm3_uvc_streaming *stream;
+
+        stream = kzalloc(sizeof(*stream), GFP_KERNEL);
+        if (stream == NULL)
+                return NULL;
+
+        mutex_init(&stream->mutex);
+
+        stream->ejcm3_dev = dev;
+        stream->intf = usb_get_intf(intf);
+        stream->intfnum = intf->cur_altsetting->desc.bInterfaceNumber;
+	v4l2_prio_init(&stream->prio);
+        // stream->pool = dev->pool;
+        stream->async_wq =
+                alloc_workqueue("ejcm3_uvc_wq",
+                                 WQ_UNBOUND | WQ_HIGHPRI, 0);
+        if (!stream->async_wq) {
+                stream_delete(stream);
+                return NULL;
+        }
+
+        return stream;
+}
+
+static void ejcm3_uvc_delete(struct kref *kref)
 {
         struct ejcm3_uvc *dev =
                 container_of(kref, struct ejcm3_uvc, kref);
+	struct list_head *p, *n;
 
-        /* shared pool belongs to device */
-        // if (dev->pool)
-        //         shared_video_pool_destroy(dev->pool);
+	usb_put_intf(dev->intf);
+	usb_put_dev(dev->udev);
+
+	list_for_each_safe(p, n, &dev->streams) {
+		struct ejcm3_uvc_streaming *stream =
+			list_entry(p, struct ejcm3_uvc_streaming, list);
+
+		usb_driver_release_interface(&ejcm3_uvc_driver, stream->intf);
+		stream_delete(stream);
+	}
 
         kfree(dev);
-}
-
-static void video_release(struct video_device *vdev)
-{
-        struct uvc_streaming_node *stream = video_get_drvdata(vdev);
-
-        kref_put(&stream->kref, stream_release);
 }
 
 /** ------------------------------------------------------------------
@@ -585,8 +719,250 @@ static const struct v4l2_file_operations ejcm3_fops = {
 };
 
 /* ------------------------------------------------------------------------
- * UVC Controls
+ * Video codecs
  */
+static int uvc_video_decode_start(struct ejcm3_uvc_streaming *stream,
+		struct video_buffer *buf, const u8 *data, int len)
+{
+	u8 header_len;
+	u8 fid;
+
+	/*
+	 * Sanity checks:
+	 * - packet must be at least 2 bytes long
+	 * - bHeaderLength value must be at least 2 bytes (see above)
+	 * - bHeaderLength value can't be larger than the packet size.
+	 */
+	if (len < 2 || data[0] < 2 || data[0] > len) {
+		// stream->stats.frame.nb_invalid++;
+		return -EINVAL;
+	}
+
+	header_len = data[0];
+	fid = data[1] & UVC_STREAM_FID;
+
+	/*
+	 * Increase the sequence number regardless of any buffer states, so
+	 * that discontinuous sequence numbers always indicate lost frames.
+	 */
+	if (stream->last_fid != fid) {
+		stream->sequence++;
+		if (stream->sequence)
+			uvc_video_stats_update(stream);
+	}
+
+	uvc_video_clock_decode(stream, buf, data, len);
+	uvc_video_stats_decode(stream, data, len);
+
+	/*
+	 * Store the payload FID bit and return immediately when the buffer is
+	 * NULL.
+	 */
+	if (buf == NULL) {
+		stream->last_fid = fid;
+		return -ENODATA;
+	}
+
+	/* Mark the buffer as bad if the error bit is set. */
+	if (data[1] & UVC_STREAM_ERR) {
+		ejcm3_uvc_dbg(stream->ejcm3_dev, FRAME,
+			"Marking buffer as bad (error bit set)\n");
+		buf->error = 1;
+	}
+
+	/*
+	 * Synchronize to the input stream by waiting for the FID bit to be
+	 * toggled when the buffer state is not UVC_BUF_STATE_ACTIVE.
+	 * stream->last_fid is initialized to -1, so the first isochronous
+	 * frame will always be in sync.
+	 *
+	 * If the device doesn't toggle the FID bit, invert stream->last_fid
+	 * when the EOF bit is set to force synchronisation on the next packet.
+	 */
+	if (buf->state != UVC_BUF_STATE_ACTIVE) {
+		if (fid == stream->last_fid) {
+			ejcm3_uvc_dbg(stream->ejcm3_dev, FRAME,
+				"Dropping payload (out of sync)\n");
+
+			return -ENODATA;
+		}
+
+		buf->buf.field = V4L2_FIELD_NONE;
+		buf->buf.sequence = stream->sequence;
+		buf->buf.vb2_buf.timestamp = ktime_to_ns(uvc_video_get_time());
+
+		/* TODO: Handle PTS and SCR. */
+		buf->state = UVC_BUF_STATE_ACTIVE;
+	}
+
+	/*
+	 * Mark the buffer as done if we're at the beginning of a new frame.
+	 * End of frame detection is better implemented by checking the EOF
+	 * bit (FID bit toggling is delayed by one frame compared to the EOF
+	 * bit), but some devices don't set the bit at end of frame (and the
+	 * last payload can be lost anyway). We thus must check if the FID has
+	 * been toggled.
+	 *
+	 * stream->last_fid is initialized to -1, so the first isochronous
+	 * frame will never trigger an end of frame detection.
+	 *
+	 * Empty buffers (bytesused == 0) don't trigger end of frame detection
+	 * as it doesn't make sense to return an empty buffer. This also
+	 * avoids detecting end of frame conditions at FID toggling if the
+	 * previous payload had the EOF bit set.
+	 */
+	if (fid != stream->last_fid && buf->byteused != 0) {
+		ejcm3_uvc_dbg(stream->ejcm3_dev, FRAME,
+			"Frame complete (FID bit toggled)\n");
+		buf->state = UVC_BUF_STATE_READY;
+		return -EAGAIN;
+	}
+
+	stream->last_fid = fid;
+
+	return header_len;
+}
+
+static void uvc_video_decode_data(struct uvc_urb *uvc_urb,
+		struct video_buffer *buf, const u8 *data, int len)
+{
+	unsigned int active_op = uvc_urb->async_operations;
+	struct uvc_copy_op *op = &uvc_urb->copy_operations[active_op];
+	unsigned int maxlen;
+
+	if (len <= 0)
+		return;
+
+	maxlen = buf->length - buf->byteused;
+
+	/* Take a buffer reference for async work. */
+	kref_get(&buf->kref);
+
+	op->buf = buf;
+	op->src = data;
+	op->dst = buf->mem + buf->byteused;
+	op->len = min_t(unsigned int, len, maxlen);
+
+	buf->byteused += op->len;
+
+	/* Complete the current frame if the buffer size was exceeded. */
+	if (len > maxlen) {
+		ejcm3_uvc_dbg(uvc_urb->stream->ejcm3_dev, FRAME,
+			"Frame complete (overflow)\n");
+		buf->error = 1;
+		buf->state = UVC_BUF_STATE_READY;
+	}
+
+	uvc_urb->async_operations++;
+}
+
+static void uvc_video_decode_end(struct ejcm3_uvc_streaming *stream,
+		struct video_buffer *buf, const u8 *data, int len)
+{
+	/* Mark the buffer as done if the EOF marker is set. */
+	if (data[1] & UVC_STREAM_EOF && buf->byteused != 0) {
+		ejcm3_uvc_dbg(stream->ejcm3_dev, FRAME, "Frame complete (EOF found)\n");
+		if (data[0] == len)
+			ejcm3_uvc_dbg(stream->ejcm3_dev, FRAME, "EOF in empty payload\n");
+		buf->state = UVC_BUF_STATE_READY;
+	}
+}
+
+/* ------------------------------------------------------------------------
+ * URB handling
+ * ------------------------------------------------------------------------ */
+/*
+ * Set error flag for incomplete buffer.
+ */
+static void uvc_video_validate_buffer(const struct ejcm3_uvc_streaming *stream,
+				      struct video_buffer *buf)
+{
+	if (stream->ctrl.dwMaxVideoFrameSize != buf->byteused &&
+	    !(stream->cur_format->flags & UVC_FMT_FLAG_COMPRESSED))
+		buf->error = 1;
+}
+
+/*
+ * Completion handler for video URBs.
+ */
+static void uvc_video_next_buffers(struct ejcm3_uvc_streaming *stream,
+				   struct video_buffer **video_buf)
+{
+	uvc_video_validate_buffer(stream, *video_buf);
+	*video_buf = uvc_queue_next_buffer(&stream->queue, *video_buf);
+}
+
+static void uvc_video_decode_bulk(struct uvc_urb *uvc_urb,
+			struct video_buffer *buf)
+{
+	struct urb *urb = uvc_urb->urb;
+	struct ejcm3_uvc_streaming *stream = uvc_urb->stream;
+	u8 *mem;
+	int len, ret;
+
+	/*
+	 * Ignore ZLPs if they're not part of a frame, otherwise process them
+	 * to trigger the end of payload detection.
+	 */
+	if (urb->actual_length == 0 && stream->bulk.header_size == 0)
+		return;
+
+	mem = urb->transfer_buffer;
+	len = urb->actual_length;
+	stream->bulk.payload_size += len;
+
+	/*
+	 * If the URB is the first of its payload, decode and save the
+	 * header.
+	 */
+	if (stream->bulk.header_size == 0 && !stream->bulk.skip_payload) {	
+		ret = uvc_video_decode_start(stream, buf, mem, len);
+
+
+		/* If an error occurred skip the rest of the payload. */
+		if (ret < 0 || buf == NULL) {
+			stream->bulk.skip_payload = 1;
+		} else {
+			memcpy(stream->bulk.header, mem, ret);
+			stream->bulk.header_size = ret;
+
+			mem += ret;
+			len -= ret;
+		}
+	}
+
+	/*
+	 * The buffer queue might have been cancelled while a bulk transfer
+	 * was in progress, so we can reach here with buf equal to NULL. Make
+	 * sure buf is never dereferenced if NULL.
+	 */
+
+	/* Prepare video data for processing. */
+	if (!stream->bulk.skip_payload && buf != NULL)
+		uvc_video_decode_data(uvc_urb, buf, mem, len);
+
+	/*
+	 * Detect the payload end by a URB smaller than the maximum size (or
+	 * a payload size equal to the maximum) and process the header again.
+	 */
+	if (urb->actual_length < urb->transfer_buffer_length ||
+	    stream->bulk.payload_size >= stream->bulk.max_payload_size) {
+		if (!stream->bulk.skip_payload && buf != NULL) {
+			uvc_video_decode_end(stream, buf, stream->bulk.header,
+				stream->bulk.payload_size);
+			if (buf->state == UVC_BUF_STATE_READY)
+				uvc_video_next_buffers(stream, &buf);
+		}
+
+		stream->bulk.header_size = 0;
+		stream->bulk.skip_payload = 0;
+		stream->bulk.payload_size = 0;
+	}
+}
+
+/* ------------------------------------------------------------------------
+ * UVC Controls
+ * ------------------------------------------------------------------------*/
 static int __uvc_query_ctrl(struct ejcm3_uvc *dev, u8 query, u8 unit,
 			u8 intfnum, u8 cs, void *data, u16 size,
 			int timeout)
@@ -602,7 +978,7 @@ static int __uvc_query_ctrl(struct ejcm3_uvc *dev, u8 query, u8 unit,
 			unit << 8 | intfnum, data, size, timeout);
 }
 
-static int uvc_get_video_ctrl(struct uvc_streaming_node *stream,
+static int uvc_get_video_ctrl(struct ejcm3_uvc_streaming *stream,
 	struct uvc_streaming_control *ctrl, int probe, u8 query)
 {
 	u16 size = 34; // 0x0110 <= uvc version < 0x0150
@@ -682,7 +1058,7 @@ out:
 	return ret;
 }
 
-static int uvc_set_video_ctrl(struct uvc_streaming_node *stream,
+static int uvc_set_video_ctrl(struct ejcm3_uvc_streaming *stream,
 	struct uvc_streaming_control *ctrl, int probe)
 {
 	u16 size = uvc_video_ctrl_size(stream);
@@ -726,61 +1102,198 @@ static int uvc_set_video_ctrl(struct uvc_streaming_node *stream,
 	kfree(data);
 	return ret;
 }
-/**/
-static struct uvc_streaming_node *stream_new(struct ejcm3_uvc *dev, struct usb_interface *intf)
-{
-        struct uvc_streaming_node *stream;
-
-        stream = kzalloc(sizeof(*stream), GFP_KERNEL);
-        if (stream == NULL)
-                return NULL;
-
-        kref_init(&stream->kref);
-        mutex_init(&stream->mutex);
-
-        stream->ejcm3_dev = dev;
-        stream->intf = usb_get_intf(intf);
-        stream->intfnum = intf->cur_altsetting->desc.bInterfaceNumber;
-        // stream->pool = dev->pool;
-        stream->async_wq =
-                alloc_workqueue("ejcm3_uvc_wq",
-                                 WQ_UNBOUND | WQ_MEM_RECLAIM, 1);
-        if (!stream->async_wq) {
-                usb_put_intf(stream->intf);
-                kfree(stream);
-                return NULL;
-        }
-
-        return stream;
-}
 
 /* -------------------------------------------------------------------
- * Parse 
+ * Parse control, streaming interface, format and frame descriptors
  * ------------------------------------------------------------------- */
+static int uvc_parse_format(struct ejcm3_uvc *dev, struct ejcm3_uvc_streaming *streaming,
+			    struct ejcm3_uvc_format *format,
+			    struct ejcm3_uvc_frame *frames,
+			    u32 **intervals, const unsigned char *buffer, int buflen)
+{
+	struct usb_interface *intf = streaming->intf;
+	struct usb_host_interface *alts = intf->cur_altsetting;
+	struct ucv_format_desc *fmtdesc;
+	struct ejcm3_uvc_frame *frame;
+	const unsigned char *start = buffer;
+	unsigned int interval;
+	unsigned int i, n;
+	u8 ftype;
+
+	format->type = buffer[2];
+	format->index = buffer[3];
+	format->frames = frames;
+
+	switch(buffer[2]) {
+		case UVC_VS_FORMAT_UNCOMPRESSED:
+		case UVC_VS_FORMAT_FRAME_BASED:
+		        n = buffer[2] == UVC_VS_FORMAT_UNCOMPRESSED ? 27 : 28;
+			if (buflen < n) {
+				ejcm3_uvc_dbg(dev, DESCR,
+					"device %d videostreaming interface %d FORMAT %u descriptor too short\n",
+					dev->udev->devnum,
+					alts->desc.bInterfaceNumber,
+					buffer[2]);
+				return -EINVAL;
+			}
+
+			fmtdesc = uvc_format_by_guid(&buffer[5]);
+			if (!fmtdesc) {
+				dev_info(&streaming->intf->dev,
+				         "Unknown video format %pU1\n", &buffer[5]);
+				return 0;
+			}
+
+			format->fcc = fmtdesc->fcc; //
+			format->bpp = buffer[21];
+
+			if (buffer[2] == UVC_VS_FORMAT_UNCOMPRESSED) {
+				ftype = UVC_VS_FRAME_UNCOMPRESSED;
+			} else {
+				ftype = UVC_VS_FRAME_FRAME_BASED;
+				if (buffer[27])
+					format->flags = UVC_FMT_FLAG_COMPRESSED;
+			}
+			break;
+		
+		case UVC_VS_FORMAT_MJPEG:
+			if (buflen < 11) {
+				ejcm3_uvc_dbg(dev, DESCR,
+					"device %d videostreaming interface %d FORMAT MJPEG descriptor too short\n",
+					dev->udev->devnum,
+					alts->desc.bInterfaceNumber);
+				return -EINVAL;	
+			}
+			format->fcc = V4L2_PIX_FMT_MJPEG;
+			format->flags = UVC_FMT_FLAG_COMPRESSED;
+			format->bpp = 0;
+			ftype = UVC_VS_FRAME_MJPEG;
+			break;
+
+		default:
+			ejcm3_uvc_dbg(dev, DESCR,
+				"device %d videostreaming interface %d FORMAT %u is not supported\n",
+				dev->udev->devnum,
+				alts->desc.bInterfaceNumber, buffer[2]);
+			return -EINVAL;
+	}
+
+	ejcm3_uvc_dbg(dev, DESCR,
+	              "Found format %p4cc", &format->fcc);
+
+	buflen -= buffer[0];
+	buffer += buffer[0];
+
+	/*
+	 * Parse the frame descriptors.
+	 * uncompressed, MJPEG and frame-based formats.
+	 */
+	while (ftype && buflen > 2 && buffer[1] == USB_DT_CS_INTERFACE &&
+	       buffer[2] == ftype) {
+		unsigned int maxIntervalIndex;
+
+		frame = &frames[format->nframes];
+		if (ftype != UVC_VS_FRAME_FRAME_BASED)
+			n = buflen > 25 ? buffer[25] : 0;
+		else
+			n = buflen > 21 ? buffer[21] : 0;
+
+		n = n ? n : 3;
+
+		if (buflen < 26 + 4*n) {
+			ejcm3_uvc_dbg(dev, DESCR,
+				"device %d videostreaming interface %d FRAME error\n",
+				dev->udev->devnum,
+				alts->desc.bInterfaceNumber);
+			return -EINVAL;
+		}
+
+		frame->bFrameIndex = buffer[3];
+		frame->bmCapabilities = buffer[4];
+		frame->wWidth = get_unaligned_le16(&buffer[5]); // * width_multiplier;
+		frame->wHeight = get_unaligned_le16(&buffer[7]);
+		frame->dwMinBitRate = get_unaligned_le32(&buffer[9]);
+		frame->dwMaxBitRate = get_unaligned_le32(&buffer[13]);
+		if (ftype != UVC_VS_FRAME_FRAME_BASED) {
+			frame->dwMaxVideoFrameBufferSize =
+				get_unaligned_le32(&buffer[17]);
+			frame->dwDefaultFrameInterval =
+				get_unaligned_le32(&buffer[21]);
+			frame->bFrameIntervalType = buffer[25];
+		} else {
+			frame->dwMaxVideoFrameBufferSize = 0;
+			frame->dwDefaultFrameInterval =
+				get_unaligned_le32(&buffer[17]);
+			frame->bFrameIntervalType = buffer[21];
+		}
+
+		/*
+		 * Copy the frame intervals.
+		 *
+		 * Some bogus devices report dwMinFrameInterval equal to
+		 * dwMaxFrameInterval and have dwFrameIntervalStep set to
+		 * zero. Setting all null intervals to 1 fixes the problem and
+		 * some other divisions by zero that could happen.
+		 */
+		frame->dwFrameInterval = *intervals;
+
+		for (i = 0; i < n; ++i) {
+			interval = get_unaligned_le32(&buffer[26+4*i]);
+			(*intervals)[i] = interval ? interval : 1;
+		}
+
+		/*
+		 * Clamp the default frame interval to the boundaries. A zero
+		 * bFrameIntervalType value indicates a continuous frame
+		 * interval range, with dwFrameInterval[0] storing the minimum
+		 * value and dwFrameInterval[1] storing the maximum value.
+		 */
+		maxIntervalIndex = frame->bFrameIntervalType ? n - 1 : 1;
+		frame->dwDefaultFrameInterval =
+			clamp(frame->dwDefaultFrameInterval,
+			      frame->dwFrameInterval[0],
+			      frame->dwFrameInterval[maxIntervalIndex]);
+
+		ejcm3_uvc_dbg(dev, DESCR, "- %ux%u (%u.%u fps)\n",
+			frame->wWidth, frame->wHeight,
+			10000000 / frame->dwDefaultFrameInterval,
+			(100000000 / frame->dwDefaultFrameInterval) % 10);
+
+		format->nframes++;
+		*intervals += n;
+
+		buflen -= buffer[0];
+		buffer += buffer[0];
+	}
+	/* No UVC_VS_STILL_IMAGE_FRAME and UVC_VS_COLORFORMAT */
+	format->colorspace = V4L2_COLORSPACE_SRGB;
+
+	return buffer - start;
+}
+
 static int uvc_parse_streaming(struct ejcm3_uvc *dev, struct usb_interface *intf)
 {
-	struct uvc_streaming_node *streaming = NULL;
-	struct uvc_format *format;
-	struct uvc_frame *frame;
+	struct ejcm3_uvc_streaming *streaming = NULL;
+	struct ejcm3_uvc_format *format;
+	struct ejcm3_uvc_frame *frame;
 	struct usb_host_interface *alts = &intf->altsetting[0];
 	const unsigned char *_buffer, *buffer = alts->extra;
 	int _buflen, buflen = alts->extralen;
 	unsigned int nformats = 0, nframes = 0, nintervals = 0;
 	unsigned int size, i, n, p;
 	u32 *interval;
-	u16 psize;
 	int ret = -EINVAL;
 
 	if (intf->cur_altsetting->desc.bInterfaceSubClass != UVC_SC_VIDEOSTREAMING) {
-		dev_dbg(dev,
+		ejcm3_uvc_dbg(dev, DESCR,
 			"device %d interface %d isn't a video streaming interface\n",
 			dev->udev->devnum,
 			intf->altsetting[0].desc.bInterfaceNumber);
 		return -EINVAL;
 	}
 
-	if (usb_driver_claim_interface(&dual_drive, intf, dev)) {
-		dev_dbg(dev,
+	if (usb_driver_claim_interface(&ejcm3_uvc_driver, intf, dev)) {
+		ejcm3_uvc_dbg(dev, DESCR,
 			"device %d interface %d is already claimed\n",
 			dev->udev->devnum,
 			intf->altsetting[0].desc.bInterfaceNumber);
@@ -789,31 +1302,8 @@ static int uvc_parse_streaming(struct ejcm3_uvc *dev, struct usb_interface *intf
 
 	streaming = stream_new(dev, intf);
 	if (streaming == NULL) {
-		usb_driver_release_interface(&dual_drive, intf);
+		usb_driver_release_interface(&ejcm3_uvc_driver, intf);
 		return -ENOMEM;
-	}
-
-	/*
-	 * The Pico iMage webcam has its class-specific interface descriptors
-	 * after the endpoint descriptors.
-	 */
-	if (buflen == 0) {
-		for (i = 0; i < alts->desc.bNumEndpoints; ++i) {
-			struct usb_host_endpoint *ep = &alts->endpoint[i];
-
-			if (ep->extralen == 0)
-				continue;
-
-			if (ep->extralen > 2 &&
-			    ep->extra[1] == USB_DT_CS_INTERFACE) {
-				uvc_dbg(dev, DESCR,
-					"trying extra data from endpoint %u\n",
-					i);
-				buffer = alts->endpoint[i].extra;
-				buflen = alts->endpoint[i].extralen;
-				break;
-			}
-		}
 	}
 
 	/* Skip the standard interface descriptors. */
@@ -823,7 +1313,7 @@ static int uvc_parse_streaming(struct ejcm3_uvc *dev, struct usb_interface *intf
 	}
 
 	if (buflen <= 2) {
-		dev_dbg(dev,
+		ejcm3_uvc_dbg(dev, DESCR,
 			"no class-specific streaming interface descriptors found\n");
 		goto error;
 	}
@@ -841,7 +1331,7 @@ static int uvc_parse_streaming(struct ejcm3_uvc *dev, struct usb_interface *intf
 		break;
 
 	default:
-		dev_dbg(dev,
+		ejcm3_uvc_dbg(dev, DESCR,
 			"device %d videostreaming interface %d HEADER descriptor not found\n",
 			dev->udev->devnum, alts->desc.bInterfaceNumber);
 		goto error;
@@ -851,7 +1341,7 @@ static int uvc_parse_streaming(struct ejcm3_uvc *dev, struct usb_interface *intf
 	n = buflen >= size ? buffer[size-1] : 0;
 
 	if (buflen < size + p*n) {
-		uvc_dbg(dev, DESCR,
+		ejcm3_uvc_dbg(dev, DESCR,
 			"device %d videostreaming interface %d HEADER descriptor is invalid\n",
 			dev->udev->devnum, alts->desc.bInterfaceNumber);
 		goto error;
@@ -904,7 +1394,7 @@ static int uvc_parse_streaming(struct ejcm3_uvc *dev, struct usb_interface *intf
 
 		case UVC_VS_FORMAT_MPEG2TS:
 		case UVC_VS_FORMAT_STREAM_BASED:
-			dev_dbg(dev,
+			ejcm3_uvc_dbg(dev, DESCR,
 				"device %d videostreaming interface %d FORMAT %u is not supported\n",
 				dev->udev->devnum,
 				alts->desc.bInterfaceNumber, _buffer[2]);
@@ -929,7 +1419,7 @@ static int uvc_parse_streaming(struct ejcm3_uvc *dev, struct usb_interface *intf
 	}
 
 	if (nformats == 0) {
-		dev_dbg(dev,
+		ejcm3_uvc_dbg(dev, DESCR,
 			"device %d videostreaming interface %d has no supported formats defined\n",
 			dev->udev->devnum, alts->desc.bInterfaceNumber);
 		goto error;
@@ -990,19 +1480,21 @@ static int uvc_parse_streaming(struct ejcm3_uvc *dev, struct usb_interface *intf
 	}
 
 	if (buflen)
-		dev_dbg(dev,
+		ejcm3_uvc_dbg(dev, DESCR,
 			"device %d videostreaming interface %d has %u bytes of trailing descriptor garbage\n",
 			dev->udev->devnum, alts->desc.bInterfaceNumber, buflen);
 
-	/* Parse the alternate settings to find the maximum bandwidth. */
-	// omit - known ep and max pkt size
+	/* 
+	 * Parse the alternate settings to find the maximum bandwidth.
+	 * Omit - bulk IN ep 0x89, wMaxPacketSize 0x0400(1024 bytes)
+	 */
 
 	list_add_tail(&streaming->list, &dev->streams);
 	return 0;
 
 error:
-	usb_driver_release_interface(&uvc_driver.driver, intf);
-	uvc_stream_delete(streaming);
+	usb_driver_release_interface(&ejcm3_uvc_driver, intf);
+	stream_delete(streaming);
 	return ret;
 }
 
@@ -1019,7 +1511,7 @@ static int uvc_parse_standard_control(struct ejcm3_uvc *dev,
                 n = buflen >= 12 ? buffer[11] : 0;
 
                 if (buflen < 12 + n) {
-                        dev_dbg(&dev->intf->dev,
+                        ejcm3_uvc_dbg(dev, DESCR,
                                 "device %d videocontrol interface %d HEADER error\n",
                                 udev->devnum, alts->desc.bInterfaceNumber);
                         return -EINVAL;
@@ -1032,7 +1524,7 @@ static int uvc_parse_standard_control(struct ejcm3_uvc *dev,
                 for (i = 0; i < n; ++i) {
                         intf = usb_ifnum_to_if(udev, buffer[12+i]);
                         if (intf == NULL) {
-                                dev_dbg(&dev->intf->dev,
+                                ejcm3_uvc_dbg(dev, DESCR,
                                         "device %d interface %d doesn't exists\n",
                                         udev->devnum, i);
                                 continue;
@@ -1042,9 +1534,12 @@ static int uvc_parse_standard_control(struct ejcm3_uvc *dev,
                 }
                 break;
 
+	case UVC_VC_OUTPUT_TERMINAL:
+		dev->output_TerminalID = buffer[3];
+		dev->output_TerminalType = get_unaligned_le16(&buffer[4]);
+		break;
 
-        case UVC_VC_INPUT_TERMINAL:
-        case UVC_VC_OUTPUT_TERMINAL:
+        case UVC_VC_INPUT_TERMINAL:       
         case UVC_VC_SELECTOR_UNIT:
         case UVC_VC_PROCESSING_UNIT:
         case UVC_VC_EXTENSION_UNIT:
@@ -1052,7 +1547,7 @@ static int uvc_parse_standard_control(struct ejcm3_uvc *dev,
                 break;
 
         default:
-                dev_dbg(&dev->intf->dev,
+                ejcm3_uvc_dbg(dev, DESCR,
                         "Found an unknown CS_INTERFACE descriptor (%u)\n",
                         buffer[2]);
                 break;
@@ -1060,6 +1555,7 @@ static int uvc_parse_standard_control(struct ejcm3_uvc *dev,
 
         return 0;
 }
+
 static int uvc_parse_control(struct ejcm3_uvc *dev)
 {
 	struct usb_host_interface *alts = dev->intf->cur_altsetting;
@@ -1087,15 +1583,33 @@ next_descriptor:
 
         return 0;
 }
+
 /* -------------------------------------------------------------------
  * register video
  * ------------------------------------------------------------------- */
-int video_init(struct uvc_streaming_node *stream) {
+static void uvc_release(struct video_device *vdev)
+{
+	struct ejcm3_uvc_streaming *stream = video_get_drvdata(vdev);
+	struct ejcm3_uvc *dev = stream->ejcm3_dev;
+
+	kref_put(&dev->kref, ejcm3_uvc_delete);
+}
+
+int video_init(struct ejcm3_uvc_streaming *stream) {
         struct uvc_streaming_control *probe = &stream->ctrl;
-        const struct uvc_format *format = NULL;
-        const struct uvc_frame *frame = NULL;
+        const struct ejcm3_uvc_format *format = NULL;
+        const struct ejcm3_uvc_frame *frame = NULL;
         struct uvc_urb *uvc_urb;
+	unsigned int i;
         int ret;
+
+	if (stream->nformats == 0) {
+		dev_info(&stream->intf->dev,
+			 "No supported video formats found.\n");
+		return -EINVAL;
+	}
+
+	atomic_set(&stream->active, 0);
 
         // GET_DEF, SET_CUR, GET_CUR
         usb_set_interface(stream->ejcm3_dev->udev, stream->intfnum, 0);
@@ -1107,32 +1621,68 @@ int video_init(struct uvc_streaming_node *stream) {
         if (ret < 0)
 		return ret;
 
+	for (i = stream->nformats; i > 0; --i) {
+		format = &stream->formats[i-1];
+		if (format->index == probe->bFormatIndex)
+			break;
+	}
 
+	if (format->nframes == 0) {
+		dev_info(&stream->intf->dev,
+			 "No frame descriptor found for the default format.\n");
+		return -EINVAL;
+	}
+
+	for (i = format->nframes; i > 0; --i) {
+		frame = &format->frames[i-1];
+		if (frame->bFrameIndex == probe->bFrameIndex)
+			break;
+	}
+
+	probe->bFormatIndex = format->index;
+	probe->bFrameIndex = frame->bFrameIndex;
+
+	stream->def_format = format;
+	stream->cur_format = format;
+	stream->cur_frame = frame;
+
+	// Default only V4L2_BUF_TYPE_VIDEO_CAPTURE
+	stream->decode = uvc_video_decode_bulk;
+
+	/* Prepare asynchronous work items. */
+	for_each_uvc_urb(uvc_urb, stream)
+		INIT_WORK(&uvc_urb->work, uvc_video_copy_data_work);
+
+	return 0;
 }
 
 /* regist /dev/videoX */
 int register_video_node(struct ejcm3_uvc *dev,
-                        struct uvc_streaming_node *stream, 
+                        struct ejcm3_uvc_streaming *stream,
+			struct video_device *vdev,
+			struct video_queue *queue,
                         const struct v4l2_file_operations *fops, 
                         const struct v4l2_ioctl_ops *ioctl_ops)
 {
         int ret;
-        struct video_device *vdev = &stream->vdev;
 
         /* queue init */
-        ret = queue_init(&stream->queue);
+        ret = queue_init(queue);
         if(ret) return ret;
 
         /* TODO: register dev v4l2*/
         vdev->v4l2_dev = &dev->v4l2_dev;
-
-        vdev->queue    = &stream->queue.queue;
-        vdev->lock     = &stream->mutex;
-
         vdev->fops = fops;
         vdev->ioctl_ops = ioctl_ops;
-        vdev->release = video_release; // /dev/videoX 被 unregister 且所有 App 都關閉後，V4L2 會呼叫此函式。
-        vdev->device_caps = V4L2_CAP_VIDEO_CAPTURE | V4L2_CAP_STREAMING;
+	/* /dev/videoX 被 unregister 且所有 App 都關閉後，V4L2 會呼叫此函式。 */
+        vdev->release = uvc_release;
+        vdev->prio = &stream->prio;
+	if (stream->type == V4L2_BUF_TYPE_VIDEO_OUTPUT)
+		vdev->vfl_dir = VFL_DIR_TX;
+	else
+		vdev->vfl_dir = VFL_DIR_RX;
+
+	vdev->device_caps = V4L2_CAP_VIDEO_CAPTURE | V4L2_CAP_STREAMING;
 
         if(global_mgr.dev_count > 1) {
                 snprintf(vdev->name, sizeof(vdev->name), "EJCM3 Dual Camera");
@@ -1140,6 +1690,10 @@ int register_video_node(struct ejcm3_uvc *dev,
                 strscpy(vdev->name, dev->name, sizeof(vdev->name));
         }
         
+	/*
+	 * Set the driver data before calling video_register_device, otherwise
+	 * the file open() handler might race us.
+	 */
         video_set_drvdata(&stream->vdev, stream);
 
         ret = video_register_device(&stream->vdev, VFL_TYPE_VIDEO, -1);
@@ -1147,25 +1701,54 @@ int register_video_node(struct ejcm3_uvc *dev,
                 return ret;
         }
 
-        kref_get(&stream->kref);
+        kref_get(&dev->kref);
         
         return 0;
 }
 
+static struct ejcm3_uvc_streaming *find_stream_by_id(struct ejcm3_uvc *dev, u8 stream_id)
+{
+	struct ejcm3_uvc_streaming *stream;
+
+	list_for_each_entry(stream, &dev->streams, list) {
+		if (stream->header.bTerminalLink == stream_id) {
+			return stream;
+		}
+	}
+
+	return NULL;
+}
+
 /* Initialize sigle ejcm3 uvc device(port) */
-static int regist_video(struct uvc_streaming_node *stream) {
+static int regist_video(struct ejcm3_uvc *dev)
+{
+	struct ejcm3_uvc_streaming *stream;
         int ret;
 
-        /* TODO: video init
+	stream = find_stream_by_id(dev, dev->output_TerminalID);
+	if (stream == NULL) {
+		dev_info(&dev->udev->dev,
+			 "No video streaming interface found for output terminal ID %u.\n",
+			 dev->output_TerminalID);
+		return -EINVAL;
+	}
+
+        /* 
          * Initialize the UVC video device by switching to alternate setting 0 and
          * retrieve the default format.
          */
         ret = video_init(stream);
         if(ret < 0) {
+		dev_err(&stream->intf->dev,
+			"Failed to initialize the device (%d).\n", ret);
                 return ret;
         }
 
-        ret = register_video_node(&stream->ejcm3_dev, stream, &ejcm3_fops, &ejcm3_ioctl_ops);
+        ret = register_video_node(&dev, stream,
+				  &stream->vdev,
+				  &stream->queue,
+				  &ejcm3_fops,
+				  &ejcm3_ioctl_ops);
 
         return ret;
 }
@@ -1176,18 +1759,22 @@ static int regist_video(struct uvc_streaming_node *stream) {
 static int ejcm3_uvc_probe(struct usb_interface *intf, const struct usb_device_id *id) {
         struct usb_device *udev = interface_to_usbdev(intf);
         struct ejcm3_uvc *dev;
-        struct uvc_streaming_node *stream;
+        struct ejcm3_uvc_streaming *stream;
         int ret;
 
         dev = kzalloc(sizeof(*dev), GFP_KERNEL);
         if (dev == NULL)
                 return -ENOMEM;
 
-        kref_init(&dev->kref);       
+	INIT_LIST_HEAD(&dev->streams);
+        kref_init(&dev->kref);
+	atomic_set(&dev->nmappings, 0);
+	mutex_init(&dev->lock);
+
         dev->udev = usb_get_dev(udev);
         dev->intf = usb_get_intf(intf);
         dev->intfnum = intf->cur_altsetting->desc.bInterfaceNumber;
-        dev->clock_frequency = 0x01C9C380;
+        // dev->clock_frequency = 0x01C9C380;
 
 	snprintf(dev->name, sizeof(dev->name),
 		 "EJCM3 (%04x:%04x)",
@@ -1200,32 +1787,27 @@ static int ejcm3_uvc_probe(struct usb_interface *intf, const struct usb_device_i
 		goto error;
 	}
 
+	dev_info(&dev->udev->dev, "Found UVC %u.%02x device %s (%04x:%04x)\n",
+		 dev->uvc_version >> 8, dev->uvc_version & 0xff,
+		 udev->product ? udev->product : "<unnamed>",
+		 le16_to_cpu(udev->descriptor.idVendor),
+		 le16_to_cpu(udev->descriptor.idProduct));
+	
+	/* Register the V4L2 device */
         ret = v4l2_device_register(&intf->dev, &dev->v4l2_dev);
-        if (ret)
-                goto err_dev;
-
-        /* shared pool (create once per device) */
-        // dev->pool = shared_video_pool_create();
-        // if (!dev->pool) {
-        //         ret = -ENOMEM;
-        //         goto err_v4l2;
-        // }
-
-        stream = stream_new(dev);
-        if (!stream) {
-                ret = -ENOMEM;
-                goto err_v4l2;
-        }
+        if (ret < 0)
+                goto error;
 
         ret = regist_video(stream);
         if (ret)
-                goto err_stream;
+                goto error;
 
         usb_set_intfdata(intf, dev);
 
-        mutex_lock(&global_mgr.lock);
-        
-        list_add_tail(&dev->list, &global_mgr.dev_list);
+	/*
+	mutex_lock(&global_mgr.lock);
+
+	list_add_tail(&dev->list, &global_mgr.dev_list);
         global_mgr.dev_count++;
         
         if (global_mgr.dev_count == 2 && !global_mgr.stitch_node) {
@@ -1234,20 +1816,14 @@ static int ejcm3_uvc_probe(struct usb_interface *intf, const struct usb_device_i
         }
 
         mutex_unlock(&global_mgr.lock);
-
+	*/
+        
         return 0;
 
-err_stream:
-        kref_put(&stream->kref, stream_release);
-// err_pool:
-//         shared_video_pool_destroy(dev->pool);
-err_v4l2:
-        v4l2_device_unregister(&dev->v4l2_dev);
-err_dev:
-        usb_put_intf(dev->intf);
-        usb_put_dev(dev->udev);
-        kfree(dev);
-        return ret;
+error:
+	uvc_unregister_video(dev);
+	kref_put(&dev->kref, ejcm3_uvc_delete);
+	return -ENODEV;
 }
 
 static void ejcm3_uvc_disconnect(struct usb_interface *intf)
@@ -1306,13 +1882,13 @@ static void ejcm3_uvc_disconnect(struct usb_interface *intf)
  * Driver initialize
  */
 
- static const struct usb_device_id ejcm3_uvc_ids[] = {
+static const struct usb_device_id ejcm3_uvc_ids[] = {
 
- };
+};
 
 MODULE_DEVICE_TABLE(usb, ejcm3_uvc_ids);
 
-struct usb_driver dual_drive = {
+struct usb_driver ejcm3_uvc_driver = {
         .name = "uvc_dual_drive",
         .probe = ejcm3_uvc_probe,
         .disconnect = ejcm3_uvc_disconnect,

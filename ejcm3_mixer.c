@@ -14,8 +14,10 @@
 #include <media/videobuf2-vmalloc.h>
 
 #define MIXER_NUM_SOURCES        2
-//#define MIXER_SRC_NUM_BUFS       4       /* 每路 UVC source 的 buffer 數 */
-#define MIXER_OUT_NUM_BUFS       4       /* output queue buffer 數 */
+//#define MIXER_SRC_NUM_BUFS       4
+#define MIXER_OUT_NUM_BUFS       4       /* output queue buffer */
+#define MIXER_SYNC_TOLERANCE_US  16667ULL   /* half frame @ 30fps */
+#define MIXER_SYNC_MAX_DROP      8
 
 #define MIXER_DEFAULT_VID        0x1E4E
 #define MIXER_DEFAULT_PID_P      0x7301
@@ -79,7 +81,7 @@ struct mixer_video_queue {
 
         spinlock_t irqlock; /* Protrcts irqqueue */
         struct list_head irqqueue;
-        wait_queue_head_t       buf_wq;
+        wait_queue_head_t buf_wq;
 };
 
 struct proxy_mixer {
@@ -348,6 +350,7 @@ void mixer_unregister_class_intf(struct proxy_mixer *mixer)
 {
     class_interface_unregister(&mixer->class_intf);
 }
+
 /* ------------------------------------------------------------------ */
 /**
  * UVC streaming control
@@ -395,9 +398,9 @@ static int mixer_uvc_reqbufs(struct proxy_mixer *mixer, int idx) {
                 pr_err("proxy_mixer: vidioc_reqbufs failed for slot%d: %d\n", idx, ret);
                 return ret;
         }
-        if (reqbufs.count < MIXER_OUT_NUM_BUFS) {
-                pr_err("proxy_mixer: slot%d requested buffer count %d less than required %d\n",
-                        idx, reqbufs.count, MIXER_OUT_NUM_BUFS);
+        if (reqbufs.count < 2) {
+                pr_err("proxy_mixer: slot%d only has %d buffers\n",
+                        idx, reqbufs.count);
                 return -ENOMEM;
         }
 
@@ -540,6 +543,197 @@ static void mixer_uvc_stop(struct proxy_mixer *mixer) {
                 mixer_uvc_streamoff(mixer, i);
         }
 }
+
+/* UVC DQBUF/QBUF */
+static int mixer_dqbuf_src(struct proxy_mixer *mixer, int slot) {
+        struct mixer_slot *src = &mixer->src[slot];
+        struct v4l2_buffer buf = {
+                .type = V4L2_BUF_TYPE_VIDEO_CAPTURE,
+                .memory = V4L2_MEMORY_MMAP,
+        };
+        int ret;
+
+        if (IS_ERR_OR_NULL(src->filp) || !src->vdev)
+                return -ENODEV;
+
+        ret = MIXER_CALL_OP(src, vidioc_dqbuf, src->filp, src->fh, &buf);
+        if (ret) {
+                pr_err("proxy_mixer: src%d DQBUF failed: %d\n", slot, ret);
+                return ret;
+        } else if (buf.index >= src->vbq->num_buffers) {
+                pr_err("proxy_mixer: src%d DQBUF got invalid buffer index %d\n",
+                        slot, buf.index);
+                return -EFAULT;
+        }
+
+        src->cur_vb = src->vbq->bufs[buf.index];
+        if (!src->cur_vb) {
+                pr_err("proxy_mixer: src%d DQBUF got invalid buffer index %d\n",
+                        slot, buf.index);
+                return -EFAULT;
+        }
+        src->cur_ts = ns_to_ktime((u64)buf.timestamp.tv_sec * NSEC_PER_SEC + buf.timestamp.tv_usec * NSEC_PER_USEC);
+        src->buf_ready = true;
+
+        return 0;
+}
+
+static void mixer_qbuf_src(struct proxy_mixer *mixer, int slot) {
+        struct mixer_slot *src = &mixer->src[slot];
+        struct v4l2_buffer buf = {
+                .index  = src->cur_vb->index,
+                .type   = V4L2_BUF_TYPE_VIDEO_CAPTURE,
+                .memory = V4L2_MEMORY_MMAP,
+        };
+
+        if (IS_ERR_OR_NULL(src->filp) || !src->vdev || !src->cur_vb)
+                return;
+        
+        MIXER_CALL_OP(src, vidioc_qbuf, src->filp, src->fh, &buf);
+        src->cur_vb = NULL;
+        src->buf_ready = false;
+}
+
+/**
+ * Simple frame synchronization based on timestamp difference(The Catch-up Mechanism).
+ */
+static void mixer_sync_frames(struct proxy_mixer *mixer) {
+        int drop = 0;
+
+        while (drop < MIXER_SYNC_MAX_DROP) {
+                ktime_t ts0 = mixer->src[0].cur_ts;
+                ktime_t ts1 = mixer->src[1].cur_ts;
+
+                s64 delta = ktime_to_us(ktime_sub(ts0, ts1));
+                if (abs(delta) <= (s64)MIXER_SYNC_TOLERANCE_US) {
+                        /* Frames are close enough, consider them synced */
+                        return;
+                } else if (delta > 0) {
+                        /* src[0] is ahead, drop it */
+                        mixer_qbuf_src(mixer, 1);
+                        if (mixer_dqbuf_src(mixer, 1) !=0) return;
+                } else {
+                        /* src[1] is ahead, drop it */
+                        mixer_qbuf_src(mixer, 0);
+                        if (mixer_dqbuf_src(mixer, 0) !=0) return;
+                }
+                drop++;
+        }
+}
+
+/* Stitching two video frames(NV12, same resolution) Top-Buttom */
+static void mixer_stitch_nv12(u8 *dst, const u8 *src0, const u8 *src1, u32 w, u32 h) {
+        u64 size_y = (u64)w * h;
+        u64 size_uv = size_y / 2;
+
+        const u8 *src0_y = src0;
+        const u8 *src0_uv = src0 + size_y;
+        const u8 *src1_y = src1;
+        const u8 *src1_uv = src1 + size_y;
+
+        u8 *dst_y_part0 = dst;
+        u8 *dst_y_part1 = dst + size_y;
+        u8 *dst_uv_part0 = dst_y_part1 + size_y;
+        u8 *dst_uv_part1 = dst_uv_part0 + size_uv;
+
+        /* Stitch the Y planes */
+        memcpy(dst_y_part0, src0_y, size_y);
+        memcpy(dst_y_part1, src1_y, size_y);
+
+        /* Stitch the UV planes */
+        memcpy(dst_uv_part0, src0_uv, size_uv);
+        memcpy(dst_uv_part1, src1_uv, size_uv);
+}
+
+static int mixer_thread_fn(void *data) {
+        struct proxy_mixer *mixer = data;
+        struct mixer_buffer *mbuf;
+        struct vb2_buffer *out_vb;
+        unsigned long flags;
+        int ret;
+
+        sched_set_fifo(current);
+
+        while (!kthread_should_stop()) {
+                ret = wait_event_interruptible(mixer->out_q.buf_wq,
+                        !list_empty(&mixer->out_q.irqqueue) ||
+                        kthread_should_stop() ||
+                        !atomic_read(&mixer->streaming));
+
+                if (kthread_should_stop() || !atomic_read(&mixer->streaming))
+                        break;
+                if (ret == -ERESTARTSYS)
+                        continue;
+
+                spin_lock_irqsave(&mixer->out_q.irqlock, flags);
+                if (list_empty(&mixer->out_q.irqqueue)) {
+                        spin_unlock_irqrestore(&mixer->out_q.irqlock, flags);
+                        continue;
+                }
+                mbuf = list_first_entry(&mixer->out_q.irqqueue, struct mixer_buffer, queue);
+                list_del(&mbuf->queue);
+                spin_unlock_irqrestore(&mixer->out_q.irqlock, flags);
+
+                out_vb = &mbuf->buf.vb2_buf;
+
+                /* DQBUF from sources */
+                ret = mixer_dqbuf_src(mixer, 0);
+                if (ret) {
+                        if (ret == -ENODEV || ret == -EIO) {
+                                /* Source disappeared or error, stop streaming */
+                                vb2_buffer_done(out_vb, VB2_BUF_STATE_ERROR);
+                                break;
+                        }
+                        spin_lock_irqsave(&mixer->out_q.irqlock, flags);
+                        mbuf->state = BUF_STATE_ERROR;
+                        list_add_tail(&mbuf->queue, &mixer->out_q.irqqueue);
+                        spin_unlock_irqrestore(&mixer->out_q.irqlock, flags);
+                        continue;
+                }
+
+                ret = mixer_dqbuf_src(mixer, 1);
+                if (ret) {
+                        if (ret == -ENODEV || ret == -EIO) {
+                                /* Source disappeared or error, stop streaming */
+                                vb2_buffer_done(out_vb, VB2_BUF_STATE_ERROR);
+                                break; 
+                        }
+                        spin_lock_irqsave(&mixer->out_q.irqlock, flags);
+                        mbuf->state = BUF_STATE_ERROR;
+                        list_add_tail(&mbuf->queue, &mixer->out_q.irqqueue);
+                        spin_unlock_irqrestore(&mixer->out_q.irqlock, flags);
+                        continue;
+                }
+
+                /* Sync Frame */
+                mixer_sync_frames(mixer);
+
+                void *dst = vb2_plane_vaddr(out_vb, 0);
+                void *src0 = mixer->src[0].cur_vb ? vb2_plane_vaddr(mixer->src[0].cur_vb, 0) : NULL;
+                void *src1 = mixer->src[1].cur_vb ? vb2_plane_vaddr(mixer->src[1].cur_vb, 0) : NULL;
+                if (!dst || !src0 || !src1) {
+                        vb2_buffer_done(out_vb, VB2_BUF_STATE_ERROR);
+                        mixer_qbuf_src(mixer, 0);
+                        mixer_qbuf_src(mixer, 1);
+                        continue;
+                }
+
+                /* Stitch frames and copy to output buffer */
+                mixer_stitch_nv12(dst, src0, src1, mixer->src_width, mixer->src_height);
+
+                vb2_set_plane_payload(out_vb, 0, (size_t)mixer->out_width * mixer->out_height * 2);
+                out_vb->timestamp = ktime_get_ns();
+                vb2_buffer_done(out_vb, VB2_BUF_STATE_DONE);
+
+                /* QBUF back to sources */
+                mixer_qbuf_src(mixer, 0);
+                mixer_qbuf_src(mixer, 1);
+        }               
+        pr_info("proxy_mixer: kthread stopped\n");
+        return 0;
+}
+
+/* ------------------------------------------------------------------ */
 
 const struct v4l2_ioctl_ops mixer_ioctl_ops = {
         // clang-format off

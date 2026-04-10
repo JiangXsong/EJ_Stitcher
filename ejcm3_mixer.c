@@ -251,8 +251,7 @@ static bool mixer_match_device(struct video_device *vdev)
         return true;
 }
 
-static int mixer_class_add_dev(struct device *dev,
-                                struct class_interface *ci)
+static int mixer_class_add_dev(struct device *dev, struct class_interface *ci)
 {
         struct proxy_mixer *mixer = container_of(ci, struct proxy_mixer, class_intf);
         struct video_device *vdev = to_video_device(dev);
@@ -277,8 +276,7 @@ static int mixer_class_add_dev(struct device *dev,
         return 0;
 }
 
-static void mixer_class_remove_dev(struct device *dev,
-                                    struct class_interface *ci)
+static void mixer_class_remove_dev(struct device *dev, struct class_interface *ci)
 {
         struct proxy_mixer *mixer = container_of(ci, struct proxy_mixer, class_intf);
         struct video_device *vdev = to_video_device(dev);
@@ -353,9 +351,23 @@ void mixer_unregister_class_intf(struct proxy_mixer *mixer)
 
 /* ------------------------------------------------------------------ */
 /**
- * UVC streaming control
+ * SRC UVC streaming control
  */
-static int mixer_uvc_negotiate_src_fmt(struct proxy_mixer *mixer, int slot) {
+static int mixer_uvc_check_slots(struct proxy_mixer *mixer)
+{
+        /* Check all source slots*/
+        mutex_lock(&mixer->src_disc_lock);
+        if (mixer->src_ready_count < MIXER_NUM_SOURCES) {
+                mutex_unlock(&mixer->src_disc_lock);
+
+                return -ENODEV;
+        }
+        mutex_unlock(&mixer->src_disc_lock);
+        return 0;        
+}
+
+static int mixer_uvc_negotiate_src_fmt(struct proxy_mixer *mixer, int slot)
+{
         struct mixer_slot *src = &mixer->src[slot];
         int ret;
 
@@ -383,7 +395,8 @@ static int mixer_uvc_negotiate_src_fmt(struct proxy_mixer *mixer, int slot) {
         return 0;
 }
 
-static int mixer_uvc_reqbufs(struct proxy_mixer *mixer, int idx) {
+static int mixer_uvc_reqbufs(struct proxy_mixer *mixer, int idx)
+{
         struct mixer_slot *src = &mixer->src[idx];
         struct v4l2_requestbuffers reqbufs = {
                 .count = MIXER_OUT_NUM_BUFS,
@@ -432,7 +445,8 @@ static int mixer_uvc_streamon(struct proxy_mixer *mixer, int idx)
         return ret;
 }
 
-static int mixer_uvc_streamoff(struct proxy_mixer *mixer, int idx) {
+static int mixer_uvc_streamoff(struct proxy_mixer *mixer, int idx)
+{
         struct mixer_slot *src = &mixer->src[idx];
         enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
         struct v4l2_requestbuffers reqbufs = {
@@ -456,17 +470,9 @@ static int mixer_uvc_streamoff(struct proxy_mixer *mixer, int idx) {
         return ret;
 }
 
-static int mixer_uvc_start(struct proxy_mixer *mixer) {
+static int mixer_uvc_start(struct proxy_mixer *mixer)
+{
         int i, ret;
-
-        /* Check all source slots*/
-        mutex_lock(&mixer->src_disc_lock);
-        if (mixer->src_ready_count < MIXER_NUM_SOURCES) {
-                mutex_unlock(&mixer->src_disc_lock);
-
-                return -ENODEV;
-        }
-        mutex_unlock(&mixer->src_disc_lock);
 
         /* Negotiate format and request buffers for each source */
         mutex_lock(&mixer->uvc_ctrl_lock);
@@ -510,7 +516,8 @@ err_out:
         return ret;       
 }
 
-static void mixer_uvc_stop(struct proxy_mixer *mixer) {
+static void mixer_uvc_stop(struct proxy_mixer *mixer)
+{
         int i;
 
         if (!atomic_cmpxchg(&mixer->streaming, 1, 0)) {
@@ -518,34 +525,22 @@ static void mixer_uvc_stop(struct proxy_mixer *mixer) {
                 return;
         }
 
+        atomic_set(&mixer->streaming, 0);
+
+        for (i = 0; i < MIXER_NUM_SOURCES; i++) {
+                mixer_uvc_streamoff(mixer, i);
+        }
+
         wake_up_all(&mixer->out_q.buf_wq);
         if (mixer->mixer_task) {
                 kthread_stop(mixer->mixer_task);
                 mixer->mixer_task = NULL;
         }
-
-        for (i = 0; i < MIXER_NUM_SOURCES; i++) {
-                struct mixer_slot *src = &mixer->src[i];
-                if (src->buf_ready) {
-                        /* Return the active buffer to the source queue */
-                        struct v4l2_buffer buf = {
-                                .index  = src->cur_vb->index,
-                                .type   = V4L2_BUF_TYPE_VIDEO_CAPTURE,
-                                .memory = V4L2_MEMORY_MMAP,
-                        };
-                        MIXER_CALL_OP(src, vidioc_qbuf, src->filp, src->fh, &buf);
-                        src->cur_vb = NULL;
-                        src->buf_ready = false;
-                }
-        }
-
-        for (i = 0; i < MIXER_NUM_SOURCES; i++) {
-                mixer_uvc_streamoff(mixer, i);
-        }
 }
 
 /* UVC DQBUF/QBUF */
-static int mixer_dqbuf_src(struct proxy_mixer *mixer, int slot) {
+static int mixer_dqbuf_src(struct proxy_mixer *mixer, int slot)
+{
         struct mixer_slot *src = &mixer->src[slot];
         struct v4l2_buffer buf = {
                 .type = V4L2_BUF_TYPE_VIDEO_CAPTURE,
@@ -578,7 +573,8 @@ static int mixer_dqbuf_src(struct proxy_mixer *mixer, int slot) {
         return 0;
 }
 
-static void mixer_qbuf_src(struct proxy_mixer *mixer, int slot) {
+static void mixer_qbuf_src(struct proxy_mixer *mixer, int slot)
+{
         struct mixer_slot *src = &mixer->src[slot];
         struct v4l2_buffer buf = {
                 .index  = src->cur_vb->index,
@@ -597,7 +593,8 @@ static void mixer_qbuf_src(struct proxy_mixer *mixer, int slot) {
 /**
  * Simple frame synchronization based on timestamp difference(The Catch-up Mechanism).
  */
-static void mixer_sync_frames(struct proxy_mixer *mixer) {
+static void mixer_sync_frames(struct proxy_mixer *mixer)
+{
         int drop = 0;
 
         while (drop < MIXER_SYNC_MAX_DROP) {
@@ -622,7 +619,8 @@ static void mixer_sync_frames(struct proxy_mixer *mixer) {
 }
 
 /* Stitching two video frames(NV12, same resolution) Top-Buttom */
-static void mixer_stitch_nv12(u8 *dst, const u8 *src0, const u8 *src1, u32 w, u32 h) {
+static void mixer_stitch_nv12(u8 *dst, const u8 *src0, const u8 *src1, u32 w, u32 h)
+{
         u64 size_y = (u64)w * h;
         u64 size_uv = size_y / 2;
 
@@ -645,7 +643,8 @@ static void mixer_stitch_nv12(u8 *dst, const u8 *src0, const u8 *src1, u32 w, u3
         memcpy(dst_uv_part1, src1_uv, size_uv);
 }
 
-static int mixer_thread_fn(void *data) {
+static int mixer_thread_fn(void *data)
+{
         struct proxy_mixer *mixer = data;
         struct mixer_buffer *mbuf;
         struct vb2_buffer *out_vb;
@@ -734,6 +733,155 @@ static int mixer_thread_fn(void *data) {
 }
 
 /* ------------------------------------------------------------------ */
+/**
+ * vb2 queue operations
+ */
+static void mixer_video_queue_return_buffers(struct mixer_video_queue *q,
+                                             enum vb2_buffer_state state)
+{
+        while (!list_empty(&q->irqqueue)) {
+                struct mixer_buffer *mbuf = list_first_entry(&q->irqqueue, struct mixer_buffer, queue);
+                list_del(&mbuf->queue);
+                vb2_buffer_done(&mbuf->buf.vb2_buf, state);
+        }
+}
+
+static int mixer_queue_setup(struct vb2_queue *vbq,
+                             unsigned int *num_buffers,
+                             unsigned int *num_planes,
+                             unsigned int sizes[],
+                             struct device *alloc_devs[])
+{
+        struct mixer_video_queue *q = vb2_get_drv_priv(vbq);
+        struct proxy_mixer *mixer = container_of(q, struct proxy_mixer, out_q);
+        unsigned int size = mixer->out_width * mixer->out_height * 2; /* NV12 */
+
+        if (*num_planes)
+                return sizes[0] < size ? -EINVAL : 0;
+
+        *num_planes = 1;
+        sizes[0] = size;
+        *num_buffers = max(*num_buffers, MIXER_OUT_NUM_BUFS);
+        return 0;
+}
+
+static int mixer_buf_prepare(struct vb2_buffer *vb)
+{
+        struct mixer_video_queue *q = vb2_get_drv_priv(vb->vb2_queue);
+        struct proxy_mixer *mixer = container_of(q, struct proxy_mixer, out_q);
+        unsigned int size = mixer->out_width * mixer->out_height * 2; /* NV12 */
+
+        if (vb->index >= q->vbq.num_buffers)
+                return -EINVAL;
+        if (vb2_plane_size(vb, 0) < size)
+                return -EINVAL;
+
+        return 0;
+}
+
+static int mixer_buf_queue(struct vb2_buffer *vb)
+{
+        struct mixer_video_queue *q = vb2_get_drv_priv(vb->vb2_queue);
+        struct vb2_v4l2_buffer *vbuf = to_vb2_v4l2_buffer(vb);
+        struct mixer_buffer *mbuf = container_of(vbuf, struct mixer_buffer, buf);
+        unsigned long flags;
+
+        mbuf->state = BUF_STATE_QUEUED;
+
+        spin_lock_irqsave(&q->irqlock, flags);
+        list_add_tail(&mbuf->queue, &q->irqqueue);
+        spin_unlock_irqrestore(&q->irqlock, flags);
+
+        wake_up_interruptible(&q->buf_wq);
+        return 0;
+}
+
+static int mixer_start_streaming(struct vb2_queue *vbq, unsigned int count)
+{
+        struct mixer_video_queue *q = vb2_get_drv_priv(vbq);
+        struct proxy_mixer *mixer = container_of(q, struct proxy_mixer, out_q);
+        unsigned long flags;
+        int ret;
+
+        lockdep_assert_irqs_enabled();
+
+        ret = mixer_uvc_start(mixer);
+        if (ret == 0) 
+                return 0;
+
+        spin_lock_irqsave(&q->irqlock, flags);
+        mixer_video_queue_return_buffers(q, VB2_BUF_STATE_QUEUED);
+        spin_unlock_irqrestore(&q->irqlock, flags);
+        return ret;
+}
+
+static void mixer_stop_streaming(struct vb2_queue *vbq)
+{
+        struct mixer_video_queue *q = vb2_get_drv_priv(vbq);
+        struct proxy_mixer *mixer = container_of(q, struct proxy_mixer, out_q);
+        unsigned long flags;
+        int i;
+
+        lockdep_assert_irqs_enabled();
+
+        mixer_uvc_stop(mixer);        
+
+        spin_lock_irqsave(&q->irqlock, flags);
+        mixer_video_queue_return_buffers(q, VB2_BUF_STATE_ERROR);
+        spin_unlock_irqrestore(&q->irqlock, flags);
+
+        for (i = 0; i < MIXER_NUM_SOURCES; i++) {
+                mixer->src[i].cur_vb = NULL;
+                mixer->src[i].buf_ready = false;
+        }
+}
+
+const struct vb2_ops mixer_vb2_ops = {
+        // clang-format off
+        .queue_setup     = mixer_queue_setup,
+        .buf_prepare     = mixer_buf_prepare,
+        .buf_queue       = mixer_buf_queue,
+        .start_streaming = mixer_start_streaming,
+        .stop_streaming  = mixer_stop_streaming,
+        .wait_prepare    = vb2_ops_wait_prepare,
+        .wait_finish     = vb2_ops_wait_finish,
+        // clang-format on
+};
+
+/* ------------------------------------------------------------------ */
+/**
+ * vidioc_streamon
+ * Check if sources are ready
+ */
+static int mixer_vidioc_streamon(struct file *file, void *fh,
+                                 enum v4l2_buf_type type)
+{
+        struct proxy_mixer *mixer = video_drvdata(file);
+        int ret;
+
+        if (type != V4L2_BUF_TYPE_VIDEO_CAPTURE)
+                return -EINVAL;
+
+        ret = mixer_uvc_check_slots(mixer);
+        if (ret)
+                return ret;
+
+        return vb2_ioctl_streamon(file, fh, type);
+}
+
+/**
+ * vidioc_streamoff
+ * Stop kthread and source streaming
+ * then call vb2_ioctl_streamoff to complete the stream off process
+ */
+static int mixer_vidioc_streamoff(struct file *file, void *fh,
+                                  enum v4l2_buf_type type)
+{
+        if (type != V4L2_BUF_TYPE_VIDEO_CAPTURE)
+                return -EINVAL;
+
+        return vb2_ioctl_streamoff(file, fh, type);
+}
 
 const struct v4l2_ioctl_ops mixer_ioctl_ops = {
         // clang-format off
@@ -756,17 +904,30 @@ const struct v4l2_ioctl_ops mixer_ioctl_ops = {
         // clang-format on
 };
 
+const struct v4l2_file_operations mixer_fops = {
+        .owner          = THIS_MODULE,
+        .open           = v4l2_fh_open,
+        .release        = vb2_fop_release,
+        .unlocked_ioctl = video_ioctl2,
+
+        .mmap           = vb2_fop_mmap,
+        .read           = vb2_fop_read,
+        .poll           = vb2_fop_poll,
+};
+
 /* ------------------------------------------------------------------ */
 /**
  * 
  */
-static void mixer_queue_release(struct mixer_video_queue *q) {
+static void mixer_queue_release(struct mixer_video_queue *q)
+{
         mutex_lock(&q->mutex);
         vb2_queue_release(&q->vbq);
         mutex_unlock(&q->mutex);
 }
 
-static int init_queue(struct mixer_video_queue *q) {
+static int init_queue(struct mixer_video_queue *q)
+{
         int ret;
 
         mutex_init(&q->mutex);
@@ -793,7 +954,8 @@ static int init_queue(struct mixer_video_queue *q) {
 
 /* ------------------------------------------------------------------ */
 /**/
-static void init_vdev(struct video_device *vdev) {
+static void init_vdev(struct video_device *vdev)
+{
         vdev->fops = &mixer_fops;
         vdev->ioctl_ops = &mixer_ioctl_ops;
         vdev->release = mixer_vdev_release;
@@ -803,7 +965,8 @@ static void init_vdev(struct video_device *vdev) {
         vdev->vfl_dir = VFL_DIR_RX;
 }
 
-static void mixer_unregister(struct proxy_mixer *mixer) {
+static void mixer_unregister(struct proxy_mixer *mixer)
+{
         if (!mixer)
                 return;
 
@@ -823,7 +986,8 @@ static void mixer_unregister(struct proxy_mixer *mixer) {
 }
 
 /**/
-static int mixer_add(void) {
+static int mixer_add(void)
+{
         struct proxy_mixer *mixer;
         int ret;
 
@@ -877,7 +1041,8 @@ err_out:
         return ret;
 }
 
-static void mixer_remove(struct proxy_mixer *mixer) {
+static void mixer_remove(struct proxy_mixer *mixer)
+{
         int i;
 
         if (!mixer)
@@ -896,6 +1061,7 @@ static void mixer_remove(struct proxy_mixer *mixer) {
 }
 
 /**/
-static int __init proxy_mixer_init(void) {
+static int __init proxy_mixer_init(void)
+{
 
 }

@@ -1,7 +1,11 @@
 # SPDX-License-Identifier: GPL-2.0
-uvcvideo_vendor-objs  := uvc_driver.o uvc_queue.o uvc_v4l2.o uvc_video.o uvc_ctrl.o \
-		  uvc_status.o uvc_isight.o uvc_debugfs.o uvc_metadata.o
-ifeq ($(CONFIG_MEDIA_CONTROLLER),y)
-uvcvideo_vendor-objs  += uvc_entity.o
-endif
-obj-$(CONFIG_USB_VIDEO_CLASS) += uvcvideo_vendor.o
+obj-m :=  ejcm3_mixer.o
+ejcm3_mixer-objs  := ejcm3_mixer.o
+
+KDIR ?= /lib/modules/$(shell uname -r)/build
+
+all:
+	$(MAKE) -C $(KDIR) M=$(PWD) modules
+
+clean:
+	$(MAKE) -C $(KDIR) M=$(PWD) clean

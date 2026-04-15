@@ -8,6 +8,7 @@
 #include <linux/usb.h>
 #include <linux/workqueue.h>
 
+#include <media/v4l2-dev.h>
 #include <media/v4l2-device.h>
 #include <media/v4l2-ioctl.h>
 #include <media/v4l2-fh.h>
@@ -67,27 +68,26 @@ struct mixer_disc_work {
         bool is_add;
 };
 
-enum buffer_state {
-        BUF_STATE_IDLE = 0,
-        BUF_STATE_QUEUED = 1,
-        BUF_STATE_ACTIVE = 2,
-        BUF_STATE_READY = 3,
-        BUF_STATE_DONE = 4,
-        BUF_STATE_ERROR = 5,
-};
+// enum buffer_state {
+//         BUF_STATE_IDLE = 0,
+//         BUF_STATE_QUEUED = 1,
+//         BUF_STATE_ACTIVE = 2,
+//         BUF_STATE_READY = 3,
+//         BUF_STATE_DONE = 4,
+//         BUF_STATE_ERROR = 5,
+// };
 
 struct mixer_buffer {
         struct vb2_v4l2_buffer buf;
         struct list_head queue;
-
-        enum buffer_state state;
+        // enum buffer_state state;
 };
 
 struct mixer_video_queue {
         struct vb2_queue vbq;
         struct mutex mutex; /* Protects queue */
 
-        spinlock_t irqlock; /* Protrcts irqqueue */
+        spinlock_t irqlock; /* Protects irqqueue */
         struct list_head irqqueue;
         wait_queue_head_t buf_wq;
 };
@@ -132,7 +132,7 @@ static void mixer_queue_release(struct mixer_video_queue *q);
 
 /* ------------------------------------------------------------------ */
 /**
- * Moudule parameters
+ * Module parameters
  */
 static unsigned int param_out_width  = 1280;
 static unsigned int param_out_height = 1440;
@@ -250,6 +250,7 @@ static void mixer_disc_work_fn(struct work_struct *w)
         }
 
         out:
+        put_device(&vdev->dev);
         kfree(dw);
 }
 
@@ -311,6 +312,8 @@ static int mixer_class_add_dev(struct device *dev, struct class_interface *ci)
         if (!dw)
                 return -ENOMEM;
 
+        /* Hold reference until workqueue processes this device */
+        get_device(&vdev->dev); 
         INIT_WORK(&dw->work, mixer_disc_work_fn);
         dw->mixer  = mixer;
         dw->vdev   = vdev;
@@ -347,6 +350,8 @@ static void mixer_class_remove_dev(struct device *dev, struct class_interface *c
         if (!dw)
                 return;
 
+        /* Hold reference until workqueue processes this device */
+        get_device(&vdev->dev);
         INIT_WORK(&dw->work, mixer_disc_work_fn);
         dw->mixer  = mixer;
         dw->vdev   = vdev;
@@ -734,7 +739,7 @@ static int mixer_thread_fn(void *data)
                                 break;
                         }
                         spin_lock_irqsave(&mixer->out_q.irqlock, flags);
-                        mbuf->state = BUF_STATE_ERROR;
+                        // mbuf->state = BUF_STATE_ERROR;
                         list_add_tail(&mbuf->queue, &mixer->out_q.irqqueue);
                         spin_unlock_irqrestore(&mixer->out_q.irqlock, flags);
                         continue;
@@ -750,7 +755,7 @@ static int mixer_thread_fn(void *data)
                                 break; 
                         }
                         spin_lock_irqsave(&mixer->out_q.irqlock, flags);
-                        mbuf->state = BUF_STATE_ERROR;
+                        // mbuf->state = BUF_STATE_ERROR;
                         list_add_tail(&mbuf->queue, &mixer->out_q.irqqueue);
                         spin_unlock_irqrestore(&mixer->out_q.irqlock, flags);
                         continue;
@@ -849,7 +854,7 @@ static void mixer_buf_queue(struct vb2_buffer *vb)
         struct mixer_buffer *mbuf = container_of(vbuf, struct mixer_buffer, buf);
         unsigned long flags;
 
-        mbuf->state = BUF_STATE_QUEUED;
+        // mbuf->state = BUF_STATE_QUEUED;
 
         spin_lock_irqsave(&q->irqlock, flags);
         list_add_tail(&mbuf->queue, &q->irqqueue);
@@ -1080,9 +1085,9 @@ static void init_vdev(struct proxy_mixer *mixer)
 
         vdev->fops = &mixer_fops;
         vdev->ioctl_ops = &mixer_ioctl_ops;
-        vdev->release = video_device_release_empty;
+        vdev->release = video_device_release;
         vdev->device_caps = V4L2_CAP_VIDEO_CAPTURE | V4L2_CAP_STREAMING;
-        strscpy(vdev->name, "Dul Video Mixer", sizeof(vdev->name));
+        strscpy(vdev->name, "Dual Video Mixer", sizeof(vdev->name));
         vdev->vfl_type = VFL_TYPE_VIDEO;
         vdev->vfl_dir = VFL_DIR_RX;
         vdev->lock = &mixer->lock;
@@ -1165,23 +1170,26 @@ static int mixer_add(void)
         }
 
         /**
-         * steel the class interface from v4l2-core to monitor video devices.
+         * steal the class interface from v4l2-core to monitor video devices.
          */
         vcls = mixer->vdev->dev.class;
         if (!vcls) {
                 pr_err("proxy_mixer: cannot get video_class from vdev\n");
                 ret = -ENODEV;
-                goto err_vdev;
+                goto err_intf;
         }
         ret = mixer_register_class_intf(mixer, vcls);
         if (ret) {
-                goto err_vdev;
+                goto err_intf;
         }
 
         g_mixer = mixer;
 
         return 0;
 
+err_intf:
+        video_set_drvdata(mixer->vdev, NULL);
+        video_unregister_device(mixer->vdev);
 err_vdev:
         video_device_release(mixer->vdev);
         mixer->vdev = NULL;

@@ -283,12 +283,19 @@ static bool mixer_match_device(struct video_device *vdev)
         intf  = to_usb_interface(intf_dev);
         udev  = interface_to_usbdev(intf);
 
-        if (le16_to_cpu(udev->descriptor.idVendor) != MIXER_DEFAULT_VID)
-                return false;
+        if (le16_to_cpu(udev->descriptor.idVendor) != MIXER_DEFAULT_VID) {
+                pr_info("proxy_mixer: ignoring USB device with VID=0x%04X\n",
+                        le16_to_cpu(udev->descriptor.idVendor));
+                return false;      
+        }
+                
 
         pid = le16_to_cpu(udev->descriptor.idProduct);
-        if (pid != MIXER_DEFAULT_PID_P && pid != MIXER_DEFAULT_PID_S)
+        if (pid != MIXER_DEFAULT_PID_P && pid != MIXER_DEFAULT_PID_S) {
+                pr_info("proxy_mixer: ignoring USB device with PID=0x%04X\n", pid);
                 return false;
+        }
+                
 
         return true;
 }
@@ -546,7 +553,6 @@ static int mixer_uvc_start(struct proxy_mixer *mixer)
                         pr_err("proxy_mixer: failed to request buffers for src%d\n", i);
                         goto err_out;
                 }
-                        goto err_out;
         }
 
         /* Stream on each source */
@@ -878,8 +884,7 @@ static int mixer_buf_prepare(struct vb2_buffer *vb)
                 return -EINVAL;
         }
         if (vb2_plane_size(vb, 0) < size) {
-                pr_err("proxy_mixer: buffer plane size %u < required %u\n",
-                        vb2_plane_size(vb, 0), size);
+                pr_err("proxy_mixer: buffer plane size < required %d\n", size);
                 return -EINVAL;
         }
 

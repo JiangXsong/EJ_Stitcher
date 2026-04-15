@@ -541,6 +541,15 @@ static int mixer_uvc_start(struct proxy_mixer *mixer)
 
         /* Negotiate format and request buffers for each source */
         mutex_lock(&mixer->uvc_ctrl_lock);
+        
+        /* First check all sources are ready before starting */
+        for (i = 0; i < MIXER_NUM_SOURCES; i++) {
+                if (IS_ERR_OR_NULL(mixer->src[i].filp) || !mixer->src[i].vdev || !mixer->src[i].vbq) {
+                        pr_err("proxy_mixer: src%d is not ready for format negotiation\n", i);
+                        return -ENODEV;
+                }
+        }
+        
         for (i = 0; i < MIXER_NUM_SOURCES; i++) {
                 ret = mixer_uvc_negotiate_src_fmt(mixer, i);
                 if (ret) {
@@ -622,7 +631,7 @@ static int mixer_dqbuf_src(struct proxy_mixer *mixer, int slot)
         };
         int ret;
 
-        if (IS_ERR_OR_NULL(src->filp) || !src->vdev)
+        if (IS_ERR_OR_NULL(src->filp) || !src->vdev || !src->vbq)
                 return -ENODEV;
 
         ret = MIXER_CALL_OP(src, vidioc_dqbuf, src->filp, src->fh, &buf);

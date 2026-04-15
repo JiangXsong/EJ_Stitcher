@@ -400,10 +400,12 @@ static void mixer_unregister_class_intf(struct proxy_mixer *mixer)
  */
 static int mixer_uvc_check_slots(struct proxy_mixer *mixer)
 {
+        pr_info("proxy_mixer: checking source slots...\n");
         mutex_lock(&mixer->src_disc_lock);
         if (mixer->src_ready_count < MIXER_NUM_SOURCES) {
+                pr_err("proxy_mixer: not all sources ready: %d/%d\n",
+                        mixer->src_ready_count, MIXER_NUM_SOURCES);
                 mutex_unlock(&mixer->src_disc_lock);
-
                 return -ENODEV;
         }
         mutex_unlock(&mixer->src_disc_lock);
@@ -500,17 +502,26 @@ static int mixer_uvc_streamoff(struct proxy_mixer *mixer, int idx)
         };
         int ret;
 
-        if (IS_ERR_OR_NULL(src->filp) || !src->vdev)
+        pr_info("proxy_mixer: streaming off src%d\n", idx);
+        if (IS_ERR_OR_NULL(src->filp) || !src->vdev) {
+                pr_err("proxy_mixer: src%d is not ready (filp=%p, vdev=%p)\n",
+                        idx, src->filp, src->vdev);
                 return -ENODEV;
+        }
 
         ret = MIXER_CALL_OP(src, vidioc_streamoff, src->filp, src->fh, type);
-        if (ret)
+        if (ret) {
+                pr_err("proxy_mixer: src%d STREAMOFF failed: %d\n", idx, ret);
                 return ret;
+        }
 
         ret = MIXER_CALL_OP(src, vidioc_reqbufs, src->filp, src->fh, &reqbufs);
-        if (ret)
+        if (ret) {
+                pr_err("proxy_mixer: src%d REQBUFS(0) failed: %d\n", idx, ret);
                 return ret;
+        }
         
+        pr_info("proxy_mixer: src%d stopped successfully\n", idx);
         return ret;
 }
 
@@ -525,11 +536,16 @@ static int mixer_uvc_start(struct proxy_mixer *mixer)
         mutex_lock(&mixer->uvc_ctrl_lock);
         for (i = 0; i < MIXER_NUM_SOURCES; i++) {
                 ret = mixer_uvc_negotiate_src_fmt(mixer, i);
-                if (ret)
+                if (ret) {
+                        pr_err("proxy_mixer: failed to negotiate format for src%d\n", i);
                         goto err_out;
+                }
 
                 ret = mixer_uvc_reqbufs(mixer, i);
-                if (ret)
+                if (ret) {
+                        pr_err("proxy_mixer: failed to request buffers for src%d\n", i);
+                        goto err_out;
+                }
                         goto err_out;
         }
 
@@ -538,6 +554,7 @@ static int mixer_uvc_start(struct proxy_mixer *mixer)
                 ret = mixer_uvc_streamon(mixer, i);
                 if (ret) {
                         /* Stream off any previously started sources */
+                        pr_err("proxy_mixer: failed to stream on src%d\n", i);
                         goto err_streamoff;
                 }
         }
@@ -567,8 +584,10 @@ static void mixer_uvc_stop(struct proxy_mixer *mixer)
 {
         int i;
 
+        pr_info("proxy_mixer: stopping mixer...\n");
         if (!atomic_cmpxchg(&mixer->streaming, 1, 0)) {
                 /* Not streaming */
+                pr_info("proxy_mixer: already stopped\n");
                 return;
         }
 
@@ -579,9 +598,12 @@ static void mixer_uvc_stop(struct proxy_mixer *mixer)
         wake_up_all(&mixer->out_q.buf_wq);
 
         if (mixer->mixer_task) {
+                pr_info("proxy_mixer: stopping kthread...\n");
                 kthread_stop(mixer->mixer_task);
                 mixer->mixer_task = NULL;
+                pr_info("proxy_mixer: kthread stopped\n");
         }
+        pr_info("proxy_mixer: mixer stopped\n");
 }
 
 /* UVC DQBUF/QBUF */
@@ -630,11 +652,16 @@ static void mixer_qbuf_src(struct proxy_mixer *mixer, int slot)
                 .type   = V4L2_BUF_TYPE_VIDEO_CAPTURE,
                 .memory = V4L2_MEMORY_MMAP,
         };
+        int ret;
 
-        if (IS_ERR_OR_NULL(src->filp) || !src->vdev || !src->cur_vb)
+        if (IS_ERR_OR_NULL(src->filp) || !src->vdev || !src->cur_vb) {
+                pr_debug("proxy_mixer: src%d qbuf skipped (invalid state)\n", slot);
                 return;
+        }
         
-        MIXER_CALL_OP(src, vidioc_qbuf, src->filp, src->fh, &buf);
+        ret = MIXER_CALL_OP(src, vidioc_qbuf, src->filp, src->fh, &buf);
+        if (ret)
+                pr_err("proxy_mixer: src%d QBUF failed: %d\n", slot, ret);
         src->cur_vb = NULL;
         src->buf_ready = false;
 }
@@ -825,12 +852,16 @@ static int mixer_queue_setup(struct vb2_queue *vbq,
         struct proxy_mixer *mixer = container_of(q, struct proxy_mixer, out_q);
         unsigned int size = mixer->out_width * mixer->out_height * 3 / 2; /* NV12 */
 
+        pr_debug("proxy_mixer: queue_setup (nplanes=%d, nbuffers=%d)\n",
+                *num_planes, *num_buffers);
         if (*num_planes)
                 return sizes[0] < size ? -EINVAL : 0;
 
         *num_planes = 1;
         sizes[0] = size;
         *num_buffers = max(*num_buffers, MIXER_OUT_NUM_BUFS);
+        pr_info("proxy_mixer: output queue setup: size=%u, buffers=%u\n",
+                size, *num_buffers);
         return 0;
 }
 
@@ -840,10 +871,17 @@ static int mixer_buf_prepare(struct vb2_buffer *vb)
         struct proxy_mixer *mixer = container_of(q, struct proxy_mixer, out_q);
         unsigned int size = mixer->out_width * mixer->out_height * 3 / 2; /* NV12 */
 
-        if (vb->index >= q->vbq.max_num_buffers)
+        pr_debug("proxy_mixer: buf_prepare idx=%d, size requirement=%u\n",
+                vb->index, size);
+        if (vb->index >= q->vbq.max_num_buffers) {
+                pr_err("proxy_mixer: buffer index %d out of range\n", vb->index);
                 return -EINVAL;
-        if (vb2_plane_size(vb, 0) < size)
+        }
+        if (vb2_plane_size(vb, 0) < size) {
+                pr_err("proxy_mixer: buffer plane size %u < required %u\n",
+                        vb2_plane_size(vb, 0), size);
                 return -EINVAL;
+        }
 
         return 0;
 }
@@ -855,6 +893,7 @@ static void mixer_buf_queue(struct vb2_buffer *vb)
         struct mixer_buffer *mbuf = container_of(vbuf, struct mixer_buffer, buf);
         unsigned long flags;
 
+        pr_debug("proxy_mixer: buf_queue idx=%d\n", vb->index);
         // mbuf->state = BUF_STATE_QUEUED;
 
         spin_lock_irqsave(&q->irqlock, flags);
@@ -871,12 +910,16 @@ static int mixer_start_streaming(struct vb2_queue *vbq, unsigned int count)
         unsigned long flags;
         int ret;
 
+        pr_info("proxy_mixer: start_streaming called with %u buffers\n", count);
         lockdep_assert_irqs_enabled();
 
         ret = mixer_uvc_start(mixer);
-        if (ret == 0) 
+        if (ret == 0) {
+                pr_info("proxy_mixer: streaming started successfully\n");
                 return 0;
+        }
 
+        pr_err("proxy_mixer: uvc_start failed: %d, returning buffers\n", ret);
         spin_lock_irqsave(&q->irqlock, flags);
         mixer_video_queue_return_buffers(q, VB2_BUF_STATE_QUEUED);
         spin_unlock_irqrestore(&q->irqlock, flags);
@@ -890,6 +933,7 @@ static void mixer_stop_streaming(struct vb2_queue *vbq)
         unsigned long flags;
         int i;
 
+        pr_info("proxy_mixer: stop_streaming called\n");
         lockdep_assert_irqs_enabled();
 
         mixer_uvc_stop(mixer);        
@@ -902,6 +946,7 @@ static void mixer_stop_streaming(struct vb2_queue *vbq)
                 mixer->src[i].cur_vb = NULL;
                 mixer->src[i].buf_ready = false;
         }
+        pr_info("proxy_mixer: stop_streaming completed\n");
 }
 
 const struct vb2_ops mixer_vb2_ops = {
@@ -963,12 +1008,17 @@ static int mixer_vidioc_streamon(struct file *file, void *fh,
         struct proxy_mixer *mixer = video_drvdata(file);
         int ret;
 
-        if (type != V4L2_BUF_TYPE_VIDEO_CAPTURE)
+        pr_info("proxy_mixer: vidioc_streamon called (type=%d)\n", type);
+        if (type != V4L2_BUF_TYPE_VIDEO_CAPTURE) {
+                pr_err("proxy_mixer: invalid buffer type %d\n", type);
                 return -EINVAL;
+        }
 
         ret = mixer_uvc_check_slots(mixer);
-        if (ret)
+        if (ret) {
+                pr_err("proxy_mixer: slot check failed: %d\n", ret);
                 return ret;
+        }
 
         return vb2_ioctl_streamon(file, fh, type);
 }
@@ -981,8 +1031,11 @@ static int mixer_vidioc_streamon(struct file *file, void *fh,
 static int mixer_vidioc_streamoff(struct file *file, void *fh,
                                   enum v4l2_buf_type type)
 {
-        if (type != V4L2_BUF_TYPE_VIDEO_CAPTURE)
+        pr_info("proxy_mixer: vidioc_streamoff called (type=%d)\n", type);
+        if (type != V4L2_BUF_TYPE_VIDEO_CAPTURE) {
+                pr_err("proxy_mixer: invalid buffer type %d\n", type);
                 return -EINVAL;
+        }
 
         return vb2_ioctl_streamoff(file, fh, type);
 }
@@ -1155,9 +1208,12 @@ static int mixer_add(void)
         const struct class *vcls;
         int ret;
 
+        pr_info("proxy_mixer: initializing mixer...\n");
         mixer = kzalloc(sizeof(*mixer), GFP_KERNEL);
-        if (!mixer)
+        if (!mixer) {
+                pr_err("proxy_mixer: failed to allocate memory for mixer\n");
                 return -ENOMEM;
+        }
 
         mutex_init(&mixer->lock);
         mutex_init(&mixer->src_disc_lock);
@@ -1171,9 +1227,11 @@ static int mixer_add(void)
 
         mixer->disc_wq = alloc_ordered_workqueue("proxy_mixer_disc", 0);
         if (!mixer->disc_wq) {
+                pr_err("proxy_mixer: failed to allocate workqueue\n");
                 ret = -ENOMEM;
                 goto err_free;
         }
+        pr_info("proxy_mixer: workqueue created\n");
         
         strscpy(mixer->v4l2_dev.name, "proxy_mixer", sizeof(mixer->v4l2_dev.name));
         ret = v4l2_device_register(NULL, &mixer->v4l2_dev);
@@ -1188,19 +1246,24 @@ static int mixer_add(void)
                 goto err_v4l2;
         }
         mixer->out_q_initialized = true;
+        pr_info("proxy_mixer: output queue initialized\n");
 
         mixer->vdev = video_device_alloc();
         if (mixer->vdev == NULL) {
+                pr_err("proxy_mixer: failed to allocate video device\n");
                 goto err_queue;
         }
 
         init_vdev(mixer);
+        pr_info("proxy_mixer: video device initialized\n");
 
         ret = video_register_device(mixer->vdev, VFL_TYPE_VIDEO, -1);
         if (ret) {
                 pr_err("proxy_mixer: video_register_device failed: %d\n", ret);
                 goto err_vdev;
         }
+        pr_info("proxy_mixer: video device registered as /dev/video%d\n",
+                mixer->vdev->num);
         g_mixer = mixer;
         /**
          * steal the class interface from v4l2-core to monitor video devices.
@@ -1213,9 +1276,12 @@ static int mixer_add(void)
         }
         ret = mixer_register_class_intf(mixer, vcls);
         if (ret) {
+                pr_err("proxy_mixer: failed to register class interface: %d\n", ret);
                 goto err_intf;
         }  
+        pr_info("proxy_mixer: class interface registered, monitoring devices...\n");
 
+        pr_info("proxy_mixer: initialization complete\n");
         return 0;
 
 err_intf:
@@ -1240,42 +1306,56 @@ static void mixer_remove(struct proxy_mixer *mixer)
 {
         int i;
 
-        if (!mixer)
+        pr_info("proxy_mixer: removing mixer...\n");
+        if (!mixer) {
+                pr_err("proxy_mixer: mixer is NULL\n");
                 return;
+        }
 
         /* unregister the class interface */
+        pr_info("proxy_mixer: unregistering class interface...\n");
         mixer_unregister_class_intf(mixer);
 
+        pr_info("proxy_mixer: draining and destroying workqueue...\n");
         drain_workqueue(mixer->disc_wq);
         destroy_workqueue(mixer->disc_wq);
         mixer->disc_wq = NULL;
 
         /* If streaming, stop */
-        mixer_uvc_stop(mixer);
+        if (atomic_read(&mixer->streaming)) {
+                pr_info("proxy_mixer: stopping active streaming...\n");
+                mixer_uvc_stop(mixer);
+        }
 
         /* close all source filp */
         for (i = 0; i < MIXER_NUM_SOURCES; i++) {
                 if (!IS_ERR_OR_NULL(mixer->src[i].filp)) {
-                filp_close(mixer->src[i].filp, NULL);
-                mixer->src[i].filp = NULL;
+                        pr_info("proxy_mixer: closing src%d...\n", i);
+                        filp_close(mixer->src[i].filp, NULL);
+                        mixer->src[i].filp = NULL;
                 }
         }
         
         /* unregister video node */
+        pr_info("proxy_mixer: unregistering video device...\n");
         mixer_unregister(mixer);
         kfree(mixer);
         g_mixer = NULL;
+        pr_info("proxy_mixer: removal complete\n");
 }
 
 /**/
 static int __init proxy_mixer_init(void)
 {
+        pr_info("proxy_mixer: module loading...\n");
         return mixer_add();
 }
 
 static void __exit proxy_mixer_exit(void)
 {
+        pr_info("proxy_mixer: module unloading...\n");
         mixer_remove(g_mixer);
+        pr_info("proxy_mixer: module unloaded\n");
 }
 
 module_init(proxy_mixer_init);

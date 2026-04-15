@@ -213,13 +213,12 @@ static void mixer_disc_work_fn(struct work_struct *w)
                 mixer->src[slot].vdev = video_devdata(filp);
                 mixer->src[slot].fh = filp->private_data;
                 mixer->src[slot].vbq = mixer->src[slot].vdev->queue;
-                mixer->src[slot].udev = interface_to_usbdev(to_usb_interface(vdev->v4l2_dev->dev));               
-                mutex_unlock(&mixer->src_disc_lock);
+                mixer->src[slot].udev = interface_to_usbdev(to_usb_interface(vdev->v4l2_dev->dev));
 
                 pr_info("proxy_mixer: slot%d filled (%s), ready=%d/%d\n",
                         slot, devpath,
                         mixer->src_ready_count, MIXER_NUM_SOURCES);
-
+                mutex_unlock(&mixer->src_disc_lock);
                 /**
                  * Pipeline is NOT started here.
                  * It is started on VIDIOC_STREAMON from userspace.
@@ -408,6 +407,7 @@ static int mixer_uvc_check_slots(struct proxy_mixer *mixer)
                 return -ENODEV;
         }
         mutex_unlock(&mixer->src_disc_lock);
+        pr_info("proxy_mixer: all source slots are filled, ready to start streaming\n");
         return 0;        
 }
 
@@ -669,6 +669,7 @@ static int mixer_sync_frames(struct proxy_mixer *mixer)
                 }
                 drop++;
         }
+        pr_info("proxy_mixer: failed to sync frames after dropping %d frames\n", drop);
         return 0;
 }
 
@@ -920,9 +921,9 @@ const struct vb2_ops mixer_vb2_ops = {
  */
 static void mixer_queue_release(struct mixer_video_queue *q)
 {
-        mutex_lock(&q->mutex);
+        // mutex_lock(&q->mutex);
         vb2_queue_release(&q->vbq);
-        mutex_unlock(&q->mutex);
+        // mutex_unlock(&q->mutex);
 }
 
 static int init_queue(struct mixer_video_queue *q)
@@ -1049,6 +1050,30 @@ static int mixer_vidioc_s_fmt(struct file *file, void *fh,
         return 0;
 }
 
+static int mixer_vidioc_s_input(struct file *file, void *fh, unsigned int input)
+{
+        if (input != 0)
+                return -EINVAL;
+        return 0;
+}
+
+static int mixer_vidioc_g_input(struct file *file, void *fh, unsigned int *input)
+{
+        *input = 0;
+        return 0;
+}
+
+static int mixer_vidioc_enum_input(struct file *file, void *fh,
+                                   struct v4l2_input *input)
+{
+        if (input->index != 0)
+                return -EINVAL;
+
+        strscpy(input->name, "Mixed Input", sizeof(input->name));
+        input->type = V4L2_INPUT_TYPE_CAMERA;
+        return 0;
+}
+
 const struct v4l2_ioctl_ops mixer_ioctl_ops = {
         // clang-format off
         .vidioc_querycap         = mixer_vidioc_querycap,
@@ -1056,6 +1081,10 @@ const struct v4l2_ioctl_ops mixer_ioctl_ops = {
         .vidioc_g_fmt_vid_cap    = mixer_vidioc_g_fmt,
         .vidioc_s_fmt_vid_cap    = mixer_vidioc_s_fmt,
         .vidioc_try_fmt_vid_cap  = mixer_vidioc_g_fmt,
+
+        .vidioc_s_input          = mixer_vidioc_s_input,
+        .vidioc_g_input          = mixer_vidioc_g_input,
+        .vidioc_enum_input       = mixer_vidioc_enum_input,
 
         .vidioc_reqbufs          = vb2_ioctl_reqbufs,
         .vidioc_querybuf         = vb2_ioctl_querybuf,

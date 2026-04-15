@@ -124,7 +124,7 @@ struct proxy_mixer {
 /* Forward declarations */
 static int  mixer_uvc_start(struct proxy_mixer *mixer);
 static void mixer_uvc_stop(struct proxy_mixer *mixer);
-static int  mixer_register_class_intf(struct proxy_mixer *mixer, struct class *vcls);
+static int  mixer_register_class_intf(struct proxy_mixer *mixer, const struct class *vcls);
 static void mixer_unregister_class_intf(struct proxy_mixer *mixer);
 static void mixer_unregister(struct proxy_mixer *mixer);
 static int  init_queue(struct mixer_video_queue *q);
@@ -294,9 +294,9 @@ static bool mixer_match_device(struct video_device *vdev)
         return true;
 }
 
-static int mixer_class_add_dev(struct device *dev, struct class_interface *ci)
+static int mixer_class_add_dev(struct device *dev)
 {
-        struct proxy_mixer *mixer = container_of(ci, struct proxy_mixer, class_intf);
+        struct proxy_mixer *mixer = g_mixer;
         struct video_device *vdev = to_video_device(dev);
         struct mixer_disc_work *dw;
 
@@ -323,9 +323,9 @@ static int mixer_class_add_dev(struct device *dev, struct class_interface *ci)
         return 0;
 }
 
-static void mixer_class_remove_dev(struct device *dev, struct class_interface *ci)
+static void mixer_class_remove_dev(struct device *dev)
 {
-        struct proxy_mixer *mixer = container_of(ci, struct proxy_mixer, class_intf);
+        struct proxy_mixer *mixer = g_mixer;
         struct video_device *vdev = to_video_device(dev);
         struct mixer_disc_work *dw;
         bool is_ours = false;
@@ -360,7 +360,7 @@ static void mixer_class_remove_dev(struct device *dev, struct class_interface *c
         queue_work(mixer->disc_wq, &dw->work);
 }
 
-static int mixer_register_class_intf(struct proxy_mixer *mixer, struct class *vcls)
+static int mixer_register_class_intf(struct proxy_mixer *mixer, const struct class *vcls)
 {
         /**
          * Three options to get vcls (video_class):
@@ -603,7 +603,7 @@ static int mixer_dqbuf_src(struct proxy_mixer *mixer, int slot)
                 return ret;
         }
         
-        if (buf.index >= src->vbq->num_buffers) {
+        if (buf.index >= src->vbq->max_num_buffers) {
                 pr_err("proxy_mixer: src%d DQBUF got invalid buffer index %d\n",
                         slot, buf.index);
                 return -EFAULT;
@@ -839,7 +839,7 @@ static int mixer_buf_prepare(struct vb2_buffer *vb)
         struct proxy_mixer *mixer = container_of(q, struct proxy_mixer, out_q);
         unsigned int size = mixer->out_width * mixer->out_height * 3 / 2; /* NV12 */
 
-        if (vb->index >= q->vbq.num_buffers)
+        if (vb->index >= q->vbq.max_num_buffers)
                 return -EINVAL;
         if (vb2_plane_size(vb, 0) < size)
                 return -EINVAL;
@@ -992,7 +992,7 @@ static int mixer_vidioc_querycap(struct file *file, void *fh,
         strscpy(cap->driver, "proxy_mixer", sizeof(cap->driver));
         strscpy(cap->card, "Proxy Video Mixer", sizeof(cap->card));
         strscpy(cap->bus_info, "platform:proxy_mixer", sizeof(cap->bus_info));
-        cap->capabilities = V4L2_CAP_VIDEO_CAPTURE | V4L2_CAP_STREAMING;
+        //cap->capabilities = V4L2_CAP_VIDEO_CAPTURE | V4L2_CAP_STREAMING;
         return 0;
 }
 
@@ -1090,7 +1090,7 @@ static void init_vdev(struct proxy_mixer *mixer)
         strscpy(vdev->name, "Dual Video Mixer", sizeof(vdev->name));
         vdev->vfl_type = VFL_TYPE_VIDEO;
         vdev->vfl_dir = VFL_DIR_RX;
-        vdev->lock = &mixer->lock;
+        vdev->lock = NULL;
 
         vdev->queue = &mixer->out_q.vbq;
         vdev->v4l2_dev = &mixer->v4l2_dev;
@@ -1123,7 +1123,7 @@ static void mixer_unregister(struct proxy_mixer *mixer)
 static int mixer_add(void)
 {
         struct proxy_mixer *mixer;
-        struct class *vcls;
+        const struct class *vcls;
         int ret;
 
         mixer = kzalloc(sizeof(*mixer), GFP_KERNEL);
@@ -1146,13 +1146,16 @@ static int mixer_add(void)
                 goto err_free;
         }
         
+        strscpy(mixer->v4l2_dev.name, "proxy_mixer", sizeof(mixer->v4l2_dev.name));
         ret = v4l2_device_register(NULL, &mixer->v4l2_dev);
         if (ret) {
+                pr_err("proxy_mixer: v4l2_device_register failed: %d\n", ret);
                 goto err_wq;
         }
 
         ret = init_queue(&mixer->out_q);
         if (ret) {
+                pr_err("proxy_mixer: init_queue failed: %d\n", ret);
                 goto err_v4l2;
         }
         mixer->out_q_initialized = true;
@@ -1166,9 +1169,10 @@ static int mixer_add(void)
 
         ret = video_register_device(mixer->vdev, VFL_TYPE_VIDEO, -1);
         if (ret) {
+                pr_err("proxy_mixer: video_register_device failed: %d\n", ret);
                 goto err_vdev;
         }
-
+        g_mixer = mixer;
         /**
          * steal the class interface from v4l2-core to monitor video devices.
          */
@@ -1181,9 +1185,7 @@ static int mixer_add(void)
         ret = mixer_register_class_intf(mixer, vcls);
         if (ret) {
                 goto err_intf;
-        }
-
-        g_mixer = mixer;
+        }  
 
         return 0;
 

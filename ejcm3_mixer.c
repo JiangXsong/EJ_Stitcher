@@ -37,9 +37,7 @@
         int __ret = -ENOTTY; \
         struct video_device *__vd = (src)->vdev; \
         if (__vd && __vd->ioctl_ops && __vd->ioctl_ops->op) { \
-                if (__vd->lock) mutex_lock(__vd->lock); \
                 __ret = __vd->ioctl_ops->op(__VA_ARGS__); \
-                if (__vd->lock) mutex_unlock(__vd->lock); \
         } \
         __ret; \
 })
@@ -213,6 +211,10 @@ static void mixer_disc_work_fn(struct work_struct *w)
                 mixer->src[slot].vdev = video_devdata(filp);
                 mixer->src[slot].fh = filp->private_data;
                 mixer->src[slot].vbq = mixer->src[slot].vdev->queue;
+                if (!mixer->src[slot].vbq) {
+                        pr_info("proxy_mixer: vdev->queue is NULL, applying uvcvideo offset hack\n");
+                        mixer->src[slot].vbq = (struct vb2_queue *)((u8 *)mixer->src[slot].vdev + sizeof(struct video_device));
+                }
                 mixer->src[slot].udev = interface_to_usbdev(to_usb_interface(vdev->v4l2_dev->dev));
 
                 pr_info("proxy_mixer: slot%d filled (%s), ready=%d/%d\n",
@@ -231,8 +233,11 @@ static void mixer_disc_work_fn(struct work_struct *w)
                  * accessing src[]. mixer_uvc_stop is idempotent (protected
                  * by atomic_cmpxchg).
                  */
+                // mutex_lock(&mixer->uvc_ctrl_lock);
                 if (atomic_read(&mixer->streaming))
                         mixer_uvc_stop(mixer);
+
+                // mutex_unlock(&mixer->uvc_ctrl_lock);
 
                 mutex_lock(&mixer->src_disc_lock);
                 for (i = 0; i < MIXER_NUM_SOURCES; i++) {
@@ -544,10 +549,13 @@ static int mixer_uvc_start(struct proxy_mixer *mixer)
         
         /* First check all sources are ready before starting */
         for (i = 0; i < MIXER_NUM_SOURCES; i++) {
-                if (IS_ERR_OR_NULL(mixer->src[i].filp) || !mixer->src[i].vdev || !mixer->src[i].vbq) {
-                        pr_err("proxy_mixer: src%d is not ready for format negotiation\n", i);
+                if (IS_ERR_OR_NULL(mixer->src[i].filp) || !mixer->src[i].vdev) {
+                        pr_err("proxy_mixer: src%d is not ready (filp=%p, vdev=%p)\n", 
+                               i, mixer->src[i].filp, mixer->src[i].vdev);
+                        mutex_unlock(&mixer->uvc_ctrl_lock);
                         return -ENODEV;
                 }
+                /* vbq will be initialized lazily on first DQBUF call */
         }
         
         for (i = 0; i < MIXER_NUM_SOURCES; i++) {
@@ -621,7 +629,6 @@ static void mixer_uvc_stop(struct proxy_mixer *mixer)
         pr_info("proxy_mixer: mixer stopped\n");
 }
 
-/* UVC DQBUF/QBUF */
 static int mixer_dqbuf_src(struct proxy_mixer *mixer, int slot)
 {
         struct mixer_slot *src = &mixer->src[slot];
@@ -631,8 +638,11 @@ static int mixer_dqbuf_src(struct proxy_mixer *mixer, int slot)
         };
         int ret;
 
-        if (IS_ERR_OR_NULL(src->filp) || !src->vdev || !src->vbq)
+        if (IS_ERR_OR_NULL(src->filp) || !src->vdev || !src->vbq) {
+                pr_err("proxy_mixer: src%d invalid state (filp=%p, vdev=%p, vbq=%p)\n",
+                       slot, src->filp, src->vdev, src->vbq);
                 return -ENODEV;
+        }
 
         ret = MIXER_CALL_OP(src, vidioc_dqbuf, src->filp, src->fh, &buf);
         if (ret) {
@@ -646,7 +656,7 @@ static int mixer_dqbuf_src(struct proxy_mixer *mixer, int slot)
                 return -EFAULT;
         }
 
-        src->cur_vb = src->vbq->bufs[buf.index];
+        src->cur_vb = vb2_get_buffer(src->vbq, buf.index);
         if (!src->cur_vb) {
                 pr_err("proxy_mixer: src%d DQBUF got invalid buffer index %d\n",
                         slot, buf.index);
@@ -670,7 +680,7 @@ static void mixer_qbuf_src(struct proxy_mixer *mixer, int slot)
         int ret;
 
         if (IS_ERR_OR_NULL(src->filp) || !src->vdev || !src->cur_vb) {
-                pr_debug("proxy_mixer: src%d qbuf skipped (invalid state)\n", slot);
+                pr_info("proxy_mixer: src%d qbuf skipped (invalid state)\n", slot);
                 return;
         }
         
@@ -756,8 +766,10 @@ static int mixer_thread_fn(void *data)
                         kthread_should_stop() ||
                         !atomic_read(&mixer->streaming));
 
-                if (kthread_should_stop() || !atomic_read(&mixer->streaming))
+                if (kthread_should_stop() || !atomic_read(&mixer->streaming)) {
+                        pr_info("proxy_mixer: kthread should stop / streaming stop\n");
                         break;
+                }
                 if (ret == -ERESTARTSYS)
                         continue;
 
@@ -779,6 +791,10 @@ static int mixer_thread_fn(void *data)
                             ret == -ENODEV || ret == -EIO) {
                                 /* Source disappeared or error, stop streaming */
                                 vb2_buffer_done(out_vb, VB2_BUF_STATE_ERROR);
+                                pr_err("proxy_mixer: src0 fatal error (%d), sleeping until kthread_stop\n", ret);
+                                while (!kthread_should_stop()) {
+                                        schedule_timeout_interruptible(HZ);
+                                }
                                 break;
                         }
                         spin_lock_irqsave(&mixer->out_q.irqlock, flags);
@@ -795,6 +811,10 @@ static int mixer_thread_fn(void *data)
                             ret == -ENODEV || ret == -EIO) {
                                 /* Source disappeared or error, stop streaming */
                                 vb2_buffer_done(out_vb, VB2_BUF_STATE_ERROR);
+                                pr_err("proxy_mixer: src1 fatal error (%d), sleeping until kthread_stop\n", ret);
+                                while (!kthread_should_stop()) {
+                                        schedule_timeout_interruptible(HZ);
+                                }
                                 break; 
                         }
                         spin_lock_irqsave(&mixer->out_q.irqlock, flags);
@@ -810,7 +830,8 @@ static int mixer_thread_fn(void *data)
                         mixer_qbuf_src(mixer, 0);
                         mixer_qbuf_src(mixer, 1);
                         vb2_buffer_done(out_vb, VB2_BUF_STATE_ERROR);
-                        break;
+                        pr_info("proxy_mixer: sync error, skipping frame.\n");
+                        continue;
                 }
 
                 {
@@ -822,7 +843,9 @@ static int mixer_thread_fn(void *data)
                         if (!dst || !src0 || !src1) {
                                 mixer_qbuf_src(mixer, 0);
                                 mixer_qbuf_src(mixer, 1);
-                                vb2_buffer_done(out_vb, VB2_BUF_STATE_ERROR);
+                                // vb2_buffer_done(out_vb, VB2_BUF_STATE_ERROR);
+                                pr_info("proxy_mixer: invalid buffer addresses (dst=%p, src0=%p, src1=%p), skipping frame\n",
+                                        dst, src0, src1);
                                 continue;
                         }
 
@@ -950,7 +973,9 @@ static void mixer_stop_streaming(struct vb2_queue *vbq)
         pr_info("proxy_mixer: stop_streaming called\n");
         lockdep_assert_irqs_enabled();
 
+        // mutex_lock(&mixer->uvc_ctrl_lock);
         mixer_uvc_stop(mixer);        
+        // mutex_unlock(&mixer->uvc_ctrl_lock);
 
         spin_lock_irqsave(&q->irqlock, flags);
         mixer_video_queue_return_buffers(q, VB2_BUF_STATE_ERROR);
@@ -1141,6 +1166,27 @@ static int mixer_vidioc_enum_input(struct file *file, void *fh,
         return 0;
 }
 
+static int mixer_vidioc_g_parm(struct file *file, void *fh, struct v4l2_streamparm *a)
+{
+        // struct proxy_mixer *mixer = video_drvdata(file);
+
+        if (a->type != V4L2_BUF_TYPE_VIDEO_CAPTURE)
+                return -EINVAL;
+
+        // if (mixer->src[0].filp && mixer->src[0].vdev && 
+        //     mixer->src[0].vdev->ioctl_ops->vidioc_g_parm) {
+        //         return MIXER_CALL_OP(&mixer->src[0], vidioc_g_parm, 
+        //                              mixer->src[0].filp, mixer->src[0].fh, a);
+        // }
+
+        /* default 30 FPS */
+        a->parm.capture.capability = V4L2_CAP_TIMEPERFRAME;
+        a->parm.capture.timeperframe.numerator = 1;
+        a->parm.capture.timeperframe.denominator = 30;
+        
+        return 0;
+}
+
 const struct v4l2_ioctl_ops mixer_ioctl_ops = {
         // clang-format off
         .vidioc_querycap         = mixer_vidioc_querycap,
@@ -1152,6 +1198,8 @@ const struct v4l2_ioctl_ops mixer_ioctl_ops = {
         .vidioc_s_input          = mixer_vidioc_s_input,
         .vidioc_g_input          = mixer_vidioc_g_input,
         .vidioc_enum_input       = mixer_vidioc_enum_input,
+
+        .vidioc_g_parm           = mixer_vidioc_g_parm,
 
         .vidioc_reqbufs          = vb2_ioctl_reqbufs,
         .vidioc_querybuf         = vb2_ioctl_querybuf,

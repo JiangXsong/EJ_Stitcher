@@ -146,6 +146,138 @@ MODULE_AUTHOR("Syu-Song Chiang");
 MODULE_DESCRIPTION("V4L2 Proxy-Mixer: combine two UVC sources in kernel space");
 
 /* ------------------------------------------------------------------ */
+/*
+ * UVC vb2_queue accessor
+ * ---------------------
+ * The UVC driver embeds vb2_queue inside:
+ *
+ *   struct uvc_streaming {
+ *       struct list_head list;
+ *       struct uvc_device *dev;
+ *       struct video_device vdev;   <-- src->vdev points here
+ *       ...
+ *       struct uvc_video_queue {
+ *           struct vb2_queue queue;   <-- vb2_queue is the FIRST member
+ *           ...
+ *       } queue;
+ *       ...    
+ *   };
+ *
+ * UVC does NOT always set video_device->queue, so we cannot rely on it.
+ *
+ * Navigation strategy (no uvcvideo.h required):
+ *   video_drvdata(src->vdev)  →  uvc_streaming *  (UVC sets this in probe)
+ *
+ * UVC's uvc_queue_init() establishes an invariant we exploit to find the
+ * queue inside the opaque uvc_streaming allocation without knowing struct
+ * offsets:
+ *
+ *   queue->queue.drv_priv = queue   (uvc_video_queue * stored in vb2_queue)
+ *
+ * Because vb2_queue is the first member of uvc_video_queue:
+ *   (void *)&vb2_queue  ==  (void *)uvc_video_queue
+ *
+ * Therefore:  vb2_queue.drv_priv  ==  (void *)&vb2_queue   (self-reference)
+ *
+ * We scan the uvc_streaming allocation looking for a vb2_queue whose
+ * drv_priv equals its own address, combined with additional sanity checks.
+ */
+
+/* Conservative upper bound for sizeof(uvc_streaming).
+ * Actual struct in recent kernels is ~2-3 KB; 8 KB gives plenty of room. 
+ */
+#define UVC_STREAM_SCAN_BYTES  8192UL
+
+/**
+ * mixer_scan_for_uvc_vbq - locate the vb2_queue embedded in a UVC streaming
+ * object by scanning for the drv_priv self-reference invariant.
+ *
+ * @stream_base: pointer to the uvc_streaming allocation (from video_drvdata)
+ *
+ * Returns a pointer to the embedded vb2_queue, or NULL if not found.
+ */
+static struct vb2_queue *mixer_scan_for_uvc_vbq(void *stream_base)
+{
+        char *p   = (char *)stream_base;
+        char *end = p + UVC_STREAM_SCAN_BYTES - sizeof(struct vb2_queue);
+        struct vb2_queue *candidate;
+
+        for (; p <= end; p += sizeof(void *)) {
+                candidate = (struct vb2_queue *)p;
+
+                /*
+                 * Invariant 1: type == V4L2_BUF_TYPE_VIDEO_CAPTURE
+                 * Set unconditionally in uvc_queue_init().
+                 */
+                if (candidate->type != V4L2_BUF_TYPE_VIDEO_CAPTURE)
+                        continue;
+
+                /*
+                 * Invariant 2: drv_priv self-reference.
+                 * uvc_queue_init sets drv_priv = (uvc_video_queue *).
+                 * Since vb2_queue is the first member, that address equals
+                 * the candidate pointer itself.  This is highly specific.
+                 */
+                if (candidate->drv_priv != (void *)candidate)
+                        continue;
+
+                /*
+                 * Invariant 3: ops/mem_ops are set by uvc_queue_init(),
+                 * both non-NULL after successful vb2_queue_init().
+                 */
+                if (!candidate->ops || !candidate->mem_ops)
+                        continue;
+
+                pr_info("proxy_mixer: found uvc vb2_queue at offset +%td within stream\n",
+                        p - (char *)stream_base);
+                return candidate;
+        }
+        return NULL;
+}
+
+/**
+ * mixer_get_uvc_vbq - get the vb2_queue for a UVC source slot.
+ *
+ * Tries video_device->queue first (set by newer UVC kernels), then falls
+ * back to scanning the uvc_streaming allocation via video_drvdata().
+ */
+static struct vb2_queue *mixer_get_uvc_vbq(struct mixer_slot *src)
+{
+        void *stream;
+        struct vb2_queue *vbq;
+
+        if (!src->vdev) {
+                pr_err("proxy_mixer: mixer_get_uvc_vbq: vdev is NULL\n");
+                return NULL;
+        }
+
+        /* Fast path: standard V4L2 (video_device->queue is populated) */
+        vbq = src->vdev->queue;
+        if (vbq) {
+                pr_info("proxy_mixer: vb2_queue from vdev->queue\n");
+                return vbq;
+        }
+
+        /*
+         * Slow path: UVC did not set vdev->queue.
+         * Retrieve uvc_streaming * via video_drvdata() — the UVC driver
+         * always calls video_set_drvdata(&stream->vdev, stream) in probe.
+         */
+        stream = video_get_drvdata(src->vdev);
+        if (!stream) {
+                pr_err("proxy_mixer: video_get_drvdata returned NULL, "
+                       "cannot locate vb2_queue\n");
+                return NULL;
+        }
+
+        vbq = mixer_scan_for_uvc_vbq(stream);
+        if (!vbq)
+                pr_err("proxy_mixer: scan failed: vb2_queue not found in "
+                       "uvc_streaming (base=%p, range=%lu B)\n",
+                       stream, UVC_STREAM_SCAN_BYTES);
+        return vbq;
+}
+
 /**
  * mixer_disc_work_fn - workqueue function for device discovery/removal.
  * 
@@ -211,10 +343,20 @@ static void mixer_disc_work_fn(struct work_struct *w)
                 mixer->src[slot].vdev = video_devdata(filp);
                 mixer->src[slot].fh = filp->private_data;
                 mixer->src[slot].vbq = mixer->src[slot].vdev->queue;
+                
+                mixer->src[slot].vbq = mixer_get_uvc_vbq(&mixer->src[slot]);
                 if (!mixer->src[slot].vbq) {
-                        pr_info("proxy_mixer: vdev->queue is NULL, applying uvcvideo offset hack\n");
-                        mixer->src[slot].vbq = (struct vb2_queue *)((u8 *)mixer->src[slot].vdev + sizeof(struct video_device));
+                        pr_err("proxy_mixer: slot%d: cannot locate vb2_queue — "
+                               "aborting slot setup\n", slot);
+                        filp_close(filp, NULL);
+                        mixer->src[slot].filp = NULL;
+                        mixer->src[slot].vdev = NULL;
+                        mixer->src[slot].fh   = NULL;
+                        mixer->src_ready_count--;
+                        mutex_unlock(&mixer->src_disc_lock);
+                        goto out;
                 }
+                
                 mixer->src[slot].udev = interface_to_usbdev(to_usb_interface(vdev->v4l2_dev->dev));
 
                 pr_info("proxy_mixer: slot%d filled (%s), ready=%d/%d\n",

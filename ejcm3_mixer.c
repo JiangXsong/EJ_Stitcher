@@ -66,19 +66,9 @@ struct mixer_disc_work {
         bool is_add;
 };
 
-// enum buffer_state {
-//         BUF_STATE_IDLE = 0,
-//         BUF_STATE_QUEUED = 1,
-//         BUF_STATE_ACTIVE = 2,
-//         BUF_STATE_READY = 3,
-//         BUF_STATE_DONE = 4,
-//         BUF_STATE_ERROR = 5,
-// };
-
 struct mixer_buffer {
         struct vb2_v4l2_buffer buf;
         struct list_head queue;
-        // enum buffer_state state;
 };
 
 struct mixer_video_queue {
@@ -102,12 +92,15 @@ struct proxy_mixer {
         struct workqueue_struct *disc_wq;
         struct mixer_slot src[MIXER_NUM_SOURCES];
 
-        /* Output format */
+        /* Output format — updated by s_fmt / s_parm */
         u32 out_width;
         u32 out_height;
         /* per-source format (src_height = out_height / 2) */
         u32 src_width;
         u32 src_height;
+        /* framerate: numerator/denominator (timeperframe) */
+        u32 fps_num;
+        u32 fps_den;
 
         struct mixer_video_queue out_q;
         bool out_q_initialized;
@@ -130,14 +123,14 @@ static void mixer_queue_release(struct mixer_video_queue *q);
 
 /* ------------------------------------------------------------------ */
 /**
- * Module parameters
+ * Fallback output dimensions used before any UVC source is discovered.
+ * Once sources are ready these are replaced by values derived from the
+ * source camera's actual capabilities.
  */
-static unsigned int param_out_width  = 1280;
-static unsigned int param_out_height = 1440;
-module_param(param_out_width,  uint, 0444);
-module_param(param_out_height, uint, 0444);
-MODULE_PARM_DESC(param_out_width,  "Combined output width  (default 1280)");
-MODULE_PARM_DESC(param_out_height, "Combined output height (default 1440)");
+#define MIXER_DEFAULT_OUT_WIDTH   1280
+#define MIXER_DEFAULT_OUT_HEIGHT  1440   /* 720 × 2 */
+#define MIXER_DEFAULT_FPS_NUM     1
+#define MIXER_DEFAULT_FPS_DEN     30
 
 static struct proxy_mixer *g_mixer;
 
@@ -147,87 +140,26 @@ MODULE_DESCRIPTION("V4L2 Proxy-Mixer: combine two UVC sources in kernel space");
 
 /* ------------------------------------------------------------------ */
 /*
- * UVC vb2_queue accessor
- * ---------------------
- * The UVC driver embeds vb2_queue inside:
- *
- *   struct uvc_streaming {
- *       struct list_head list;
- *       struct uvc_device *dev;
- *       struct video_device vdev;   <-- src->vdev points here
- *       ...
- *       struct uvc_video_queue {
- *           struct vb2_queue queue;   <-- vb2_queue is the FIRST member
- *           ...
- *       } queue;
- *       ...    
- *   };
- *
- * UVC does NOT always set video_device->queue, so we cannot rely on it.
- *
- * Navigation strategy (no uvcvideo.h required):
- *   video_drvdata(src->vdev)  →  uvc_streaming *  (UVC sets this in probe)
- *
- * UVC's uvc_queue_init() establishes an invariant we exploit to find the
- * queue inside the opaque uvc_streaming allocation without knowing struct
- * offsets:
- *
- *   queue->queue.drv_priv = queue   (uvc_video_queue * stored in vb2_queue)
- *
- * Because vb2_queue is the first member of uvc_video_queue:
- *   (void *)&vb2_queue  ==  (void *)uvc_video_queue
- *
- * Therefore:  vb2_queue.drv_priv  ==  (void *)&vb2_queue   (self-reference)
- *
- * We scan the uvc_streaming allocation looking for a vb2_queue whose
- * drv_priv equals its own address, combined with additional sanity checks.
- */
-
-/* Conservative upper bound for sizeof(uvc_streaming).
- * Actual struct in recent kernels is ~2-3 KB; 8 KB gives plenty of room. 
+ * UVC vb2_queue accessor — see previous commit for full rationale.
+ * Scans the opaque uvc_streaming allocation for a vb2_queue whose
+ * drv_priv == &self (invariant set by uvc_queue_init).
  */
 #define UVC_STREAM_SCAN_BYTES  8192UL
 
-/**
- * mixer_scan_for_uvc_vbq - locate the vb2_queue embedded in a UVC streaming
- * object by scanning for the drv_priv self-reference invariant.
- *
- * @stream_base: pointer to the uvc_streaming allocation (from video_drvdata)
- *
- * Returns a pointer to the embedded vb2_queue, or NULL if not found.
- */
 static struct vb2_queue *mixer_scan_for_uvc_vbq(void *stream_base)
 {
-        char *p   = (char *)stream_base;
+        char *p = (char *)stream_base;
         char *end = p + UVC_STREAM_SCAN_BYTES - sizeof(struct vb2_queue);
         struct vb2_queue *candidate;
 
         for (; p <= end; p += sizeof(void *)) {
                 candidate = (struct vb2_queue *)p;
-
-                /*
-                 * Invariant 1: type == V4L2_BUF_TYPE_VIDEO_CAPTURE
-                 * Set unconditionally in uvc_queue_init().
-                 */
                 if (candidate->type != V4L2_BUF_TYPE_VIDEO_CAPTURE)
                         continue;
-
-                /*
-                 * Invariant 2: drv_priv self-reference.
-                 * uvc_queue_init sets drv_priv = (uvc_video_queue *).
-                 * Since vb2_queue is the first member, that address equals
-                 * the candidate pointer itself.  This is highly specific.
-                 */
                 if (candidate->drv_priv != (void *)candidate)
                         continue;
-
-                /*
-                 * Invariant 3: ops/mem_ops are set by uvc_queue_init(),
-                 * both non-NULL after successful vb2_queue_init().
-                 */
                 if (!candidate->ops || !candidate->mem_ops)
                         continue;
-
                 pr_info("proxy_mixer: found uvc vb2_queue at offset +%td\n",
                         p - (char *)stream_base);
                 return candidate;
@@ -235,45 +167,32 @@ static struct vb2_queue *mixer_scan_for_uvc_vbq(void *stream_base)
         return NULL;
 }
 
-/**
- * mixer_get_uvc_vbq - get the vb2_queue for a UVC source slot.
- *
- * Tries video_device->queue first (set by newer UVC kernels), then falls
- * back to scanning the uvc_streaming allocation via video_drvdata().
- */
 static struct vb2_queue *mixer_get_uvc_vbq(struct mixer_slot *src)
 {
         void *stream;
         struct vb2_queue *vbq;
 
-        if (!src->vdev) {
-                pr_err("proxy_mixer: mixer_get_uvc_vbq: vdev is NULL\n");
+        if (!src->vdev)
                 return NULL;
-        }
 
-        /* Fast path: standard V4L2 (video_device->queue is populated) */
+        /* Fast path: vdev->queue populated by newer UVC / standard V4L2 */
         vbq = src->vdev->queue;
-        if (vbq) {
-                pr_info("proxy_mixer: vb2_queue from vdev->queue\n");
+        if (vbq)
                 return vbq;
-        }
 
         /* Slow path: scan uvc_streaming via video_drvdata */
         stream = video_get_drvdata(src->vdev);
         if (!stream) {
-                pr_err("proxy_mixer: video_get_drvdata returned NULL, "
-                       "cannot locate vb2_queue\n");
+                pr_err("proxy_mixer: video_get_drvdata NULL\n");
                 return NULL;
         }
-
         vbq = mixer_scan_for_uvc_vbq(stream);
         if (!vbq)
-                pr_err("proxy_mixer: scan failed: vb2_queue not found in "
-                       "uvc_streaming (base=%p, range=%lu B)\n",
-                       stream, UVC_STREAM_SCAN_BYTES);
+                pr_err("proxy_mixer: vb2_queue not found in uvc_streaming\n");
         return vbq;
 }
 
+/* ------------------------------------------------------------------ */
 /**
  * mixer_disc_work_fn - workqueue function for device discovery/removal.
  * 
@@ -338,12 +257,9 @@ static void mixer_disc_work_fn(struct work_struct *w)
                 mixer->src[slot].filp = filp;
                 mixer->src[slot].vdev = video_devdata(filp);
                 mixer->src[slot].fh = filp->private_data;
-                mixer->src[slot].vbq = mixer->src[slot].vdev->queue;
-                
                 mixer->src[slot].vbq = mixer_get_uvc_vbq(&mixer->src[slot]);
                 if (!mixer->src[slot].vbq) {
-                        pr_err("proxy_mixer: slot%d: cannot locate vb2_queue — "
-                               "aborting slot setup\n", slot);
+                        pr_err("proxy_mixer: slot%d: cannot locate vb2_queue\n", slot);
                         filp_close(filp, NULL);
                         mixer->src[slot].filp = NULL;
                         mixer->src[slot].vdev = NULL;
@@ -351,7 +267,7 @@ static void mixer_disc_work_fn(struct work_struct *w)
                         mixer->src_ready_count--;
                         mutex_unlock(&mixer->src_disc_lock);
                         goto out;
-                }                
+                }
                 mixer->src[slot].udev = interface_to_usbdev(to_usb_interface(vdev->v4l2_dev->dev));
 
                 pr_info("proxy_mixer: slot%d filled (%s), ready=%d/%d\n",
@@ -422,8 +338,8 @@ static bool mixer_match_device(struct video_device *vdev)
                 return false;
 
         /* USB VID/PID */
-        intf  = to_usb_interface(intf_dev);
-        udev  = interface_to_usbdev(intf);
+        intf = to_usb_interface(intf_dev);
+        udev = interface_to_usbdev(intf);
 
         if (le16_to_cpu(udev->descriptor.idVendor) != MIXER_DEFAULT_VID) {
                 pr_info("proxy_mixer: ignoring USB device with VID=0x%04X\n",
@@ -463,8 +379,8 @@ static int mixer_class_add_dev(struct device *dev)
         /* Hold reference until workqueue processes this device */
         get_device(&vdev->dev); 
         INIT_WORK(&dw->work, mixer_disc_work_fn);
-        dw->mixer  = mixer;
-        dw->vdev   = vdev;
+        dw->mixer = mixer;
+        dw->vdev = vdev;
         dw->is_add = true;
 
         queue_work(mixer->disc_wq, &dw->work);
@@ -501,8 +417,8 @@ static void mixer_class_remove_dev(struct device *dev)
         /* Hold reference until workqueue processes this device */
         get_device(&vdev->dev);
         INIT_WORK(&dw->work, mixer_disc_work_fn);
-        dw->mixer  = mixer;
-        dw->vdev   = vdev;
+        dw->mixer = mixer;
+        dw->vdev = vdev;
         dw->is_add = false;
 
         queue_work(mixer->disc_wq, &dw->work);
@@ -525,8 +441,8 @@ static int mixer_register_class_intf(struct proxy_mixer *mixer, const struct cla
          *    - Add patch in v4l2-dev.c: EXPORT_SYMBOL(video_class);
          * --
          */
-        mixer->class_intf.class      = vcls;
-        mixer->class_intf.add_dev    = mixer_class_add_dev;
+        mixer->class_intf.class = vcls;
+        mixer->class_intf.add_dev = mixer_class_add_dev;
         mixer->class_intf.remove_dev = mixer_class_remove_dev;
 
         /**
@@ -591,6 +507,38 @@ static int mixer_uvc_negotiate_src_fmt(struct proxy_mixer *mixer, int slot)
         return 0;
 }
 
+/**
+ * mixer_uvc_negotiate_src_fps - set the frame interval on a UVC source.
+ *
+ * Called after s_fmt so the UVC driver knows the active resolution.
+ * Uses mixer->fps_num / fps_den chosen by userspace via s_parm.
+ */
+static int mixer_uvc_negotiate_src_fps(struct proxy_mixer *mixer, int slot)
+{
+        struct mixer_slot *src = &mixer->src[slot];
+        struct v4l2_streamparm parm = {
+                .type = V4L2_BUF_TYPE_VIDEO_CAPTURE,
+        };
+        int ret;
+
+        parm.parm.capture.timeperframe.numerator = mixer->fps_num;
+        parm.parm.capture.timeperframe.denominator = mixer->fps_den;
+
+        ret = MIXER_CALL_OP(src, vidioc_s_parm, src->filp, src->fh, &parm);
+        if (ret) {
+                /* Not fatal — some UVC devices don't support s_parm */
+                pr_info("proxy_mixer: src%d s_parm failed: %d (non-fatal)\n",
+                        slot, ret);
+                return 0;
+        }
+
+        pr_info("proxy_mixer: src%d fps negotiated: %u/%u\n",
+                slot,
+                parm.parm.capture.timeperframe.denominator,
+                parm.parm.capture.timeperframe.numerator);
+        return 0;
+}
+
 static int mixer_uvc_reqbufs(struct proxy_mixer *mixer, int idx)
 {
         struct mixer_slot *src = &mixer->src[idx];
@@ -615,8 +563,8 @@ static int mixer_uvc_reqbufs(struct proxy_mixer *mixer, int idx)
 
         for (i = 0; i < reqbufs.count; i++) {
                 struct v4l2_buffer buf = {
-                        .index  = i,
-                        .type   = V4L2_BUF_TYPE_VIDEO_CAPTURE,
+                        .index = i,
+                        .type = V4L2_BUF_TYPE_VIDEO_CAPTURE,
                         .memory = V4L2_MEMORY_MMAP,
                 };
                 ret = MIXER_CALL_OP(src, vidioc_qbuf, src->filp, src->fh, &buf);
@@ -702,6 +650,8 @@ static int mixer_uvc_start(struct proxy_mixer *mixer)
                         goto err_out;
                 }
 
+                mixer_uvc_negotiate_src_fps(mixer, i);
+
                 ret = mixer_uvc_reqbufs(mixer, i);
                 if (ret) {
                         pr_err("proxy_mixer: failed to request buffers for src%d\n", i);
@@ -752,7 +702,7 @@ static void mixer_uvc_stop(struct proxy_mixer *mixer)
         }
 
         wake_up_all(&mixer->out_q.buf_wq);
-        
+
         for (i = 0; i < MIXER_NUM_SOURCES; i++) {
                 mixer_uvc_streamoff(mixer, i);
         }
@@ -812,8 +762,8 @@ static void mixer_qbuf_src(struct proxy_mixer *mixer, int slot)
 {
         struct mixer_slot *src = &mixer->src[slot];
         struct v4l2_buffer buf = {
-                .index  = src->cur_vb->index,
-                .type   = V4L2_BUF_TYPE_VIDEO_CAPTURE,
+                .index = src->cur_vb->index,
+                .type = V4L2_BUF_TYPE_VIDEO_CAPTURE,
                 .memory = V4L2_MEMORY_MMAP,
         };
         int ret;
@@ -923,6 +873,13 @@ static int mixer_thread_fn(void *data)
 
                 out_vb = &mbuf->buf.vb2_buf;
 
+                /*
+                 * Check streaming flag before each blocking DQBUF.
+                 * mixer_uvc_stop() sets streaming=0 then streamoffs sources;
+                 * if we see 0 here, sources may already be stopped so DQBUF
+                 * would return -EINVAL.  Return the output buffer to the
+                 * queue and let stop_streaming clean it up.
+                 */
                 if (!atomic_read(&mixer->streaming))
                         goto return_buf;
 
@@ -940,7 +897,6 @@ static int mixer_thread_fn(void *data)
                         }
                         /* Transient error — re-queue output buf and retry */
                         spin_lock_irqsave(&mixer->out_q.irqlock, flags);
-                        // mbuf->state = BUF_STATE_ERROR;
                         list_add_tail(&mbuf->queue, &mixer->out_q.irqqueue);
                         spin_unlock_irqrestore(&mixer->out_q.irqlock, flags);
                         continue;
@@ -964,7 +920,6 @@ static int mixer_thread_fn(void *data)
                                 break;
                         }
                         spin_lock_irqsave(&mixer->out_q.irqlock, flags);
-                        // mbuf->state = BUF_STATE_ERROR;
                         list_add_tail(&mbuf->queue, &mixer->out_q.irqqueue);
                         spin_unlock_irqrestore(&mixer->out_q.irqlock, flags);
                         continue;
@@ -989,7 +944,6 @@ static int mixer_thread_fn(void *data)
                         if (!dst || !src0 || !src1) {
                                 mixer_qbuf_src(mixer, 0);
                                 mixer_qbuf_src(mixer, 1);
-                                // vb2_buffer_done(out_vb, VB2_BUF_STATE_ERROR);
                                 pr_info("proxy_mixer: invalid buffer addresses (dst=%p, src0=%p, src1=%p), skipping frame\n",
                                         dst, src0, src1);
                                 continue;
@@ -1009,6 +963,7 @@ static int mixer_thread_fn(void *data)
         }               
         pr_info("proxy_mixer: kthread exiting\n");
         return 0;
+
 return_buf:
         /*
          * Shutdown path: return the output buffer to irqqueue so that
@@ -1291,11 +1246,52 @@ static int mixer_vidioc_s_fmt(struct file *file, void *fh,
         if (fmt->fmt.pix.pixelformat != V4L2_PIX_FMT_NV12)
                 return -EINVAL;
 
-        /**
-         * For simplicity, we only support NV12 format
-         * and the output resolution is determined by module parameters.
+        /*
+         * Accept the userspace-requested resolution.
+         * out_height must be even (top-bottom stitch of two equal halves).
          */
+        mutex_lock(&mixer->lock);
+        if (fmt->fmt.pix.width > 0 && fmt->fmt.pix.height >= 2) {
+                mixer->out_width = fmt->fmt.pix.width;
+                mixer->out_height = fmt->fmt.pix.height & ~1u; /* round down to even */
+                mixer->src_width = mixer->out_width;
+                mixer->src_height = mixer->out_height / 2;
+                pr_info("proxy_mixer: s_fmt accepted %ux%u (src %ux%u)\n",
+                        mixer->out_width, mixer->out_height,
+                        mixer->src_width, mixer->src_height);
+        }
+        mutex_unlock(&mixer->lock);
+
+        /* Return the (possibly adjusted) format back to userspace */
         fill_fmt(mixer, fmt);
+        return 0;
+}
+
+static int mixer_vidioc_try_fmt(struct file *file, void *fh,
+                               struct v4l2_format *fmt)
+{
+        struct proxy_mixer *mixer = video_drvdata(file);
+
+        if (fmt->type != V4L2_BUF_TYPE_VIDEO_CAPTURE)
+                return -EINVAL;
+
+        /* Only NV12 supported */
+        fmt->fmt.pix.pixelformat = V4L2_PIX_FMT_NV12;
+        fmt->fmt.pix.field = V4L2_FIELD_NONE;
+        fmt->fmt.pix.colorspace = V4L2_COLORSPACE_SRGB;
+
+        /* Accept proposed size if valid, otherwise return current */
+        if (fmt->fmt.pix.width == 0 || fmt->fmt.pix.height < 2) {
+                mutex_lock(&mixer->lock);
+                fmt->fmt.pix.width = mixer->out_width;
+                fmt->fmt.pix.height = mixer->out_height;
+                mutex_unlock(&mixer->lock);
+        } else {
+                fmt->fmt.pix.height &= ~1u; /* round down to even */
+        }
+
+        fmt->fmt.pix.bytesperline = fmt->fmt.pix.width;
+        fmt->fmt.pix.sizeimage = fmt->fmt.pix.width * fmt->fmt.pix.height * 3 / 2;
         return 0;
 }
 
@@ -1325,23 +1321,138 @@ static int mixer_vidioc_enum_input(struct file *file, void *fh,
 
 static int mixer_vidioc_g_parm(struct file *file, void *fh, struct v4l2_streamparm *a)
 {
-        // struct proxy_mixer *mixer = video_drvdata(file);
+        struct proxy_mixer *mixer = video_drvdata(file);
 
         if (a->type != V4L2_BUF_TYPE_VIDEO_CAPTURE)
                 return -EINVAL;
 
-        // if (mixer->src[0].filp && mixer->src[0].vdev && 
-        //     mixer->src[0].vdev->ioctl_ops->vidioc_g_parm) {
-        //         return MIXER_CALL_OP(&mixer->src[0], vidioc_g_parm, 
-        //                              mixer->src[0].filp, mixer->src[0].fh, a);
-        // }
-
-        /* default 30 FPS */
+        memset(&a->parm.capture, 0, sizeof(a->parm.capture));
         a->parm.capture.capability = V4L2_CAP_TIMEPERFRAME;
-        a->parm.capture.timeperframe.numerator = 1;
-        a->parm.capture.timeperframe.denominator = 30;
-        
+
+        mutex_lock(&mixer->lock);
+        a->parm.capture.timeperframe.numerator = mixer->fps_num;
+        a->parm.capture.timeperframe.denominator = mixer->fps_den;
+        mutex_unlock(&mixer->lock);
+
         return 0;
+}
+
+static int mixer_vidioc_s_parm(struct file *file, void *fh, struct v4l2_streamparm *a)
+{
+        struct proxy_mixer *mixer = video_drvdata(file);
+
+        if (a->type != V4L2_BUF_TYPE_VIDEO_CAPTURE)
+                return -EINVAL;
+
+        mutex_lock(&mixer->lock);
+        if (a->parm.capture.timeperframe.numerator &&
+            a->parm.capture.timeperframe.denominator) {
+                mixer->fps_num = a->parm.capture.timeperframe.numerator;
+                mixer->fps_den = a->parm.capture.timeperframe.denominator;
+                pr_info("proxy_mixer: s_parm fps=%u/%u\n",
+                        mixer->fps_den, mixer->fps_num);
+        }
+        mutex_unlock(&mixer->lock);
+
+        /* Read back what we stored */
+        return mixer_vidioc_g_parm(file, fh, a);
+}
+
+/* ------------------------------------------------------------------ */
+/**
+ * mixer_vidioc_enum_framesizes - proxy ENUM_FRAMESIZES from a UVC source.
+ *
+ * Returns V4L2_FRMSIZE_TYPE_DISCRETE entries.  Each entry's height is
+ * doubled (top-bottom stitch) compared to the source camera's native
+ * height.  Width is passed through unchanged.
+ *
+ * Requires at least one source to be discovered (src_ready_count >= 1).
+ */
+static int mixer_vidioc_enum_framesizes(struct file *file, void *fh,
+                                        struct v4l2_frmsizeenum *fsize)
+{
+        struct proxy_mixer *mixer = video_drvdata(file);
+        struct mixer_slot *src;
+        int ret;
+
+        /* Only NV12 */
+        if (fsize->pixel_format != V4L2_PIX_FMT_NV12)
+                return -EINVAL;
+
+        mutex_lock(&mixer->src_disc_lock);
+        if (mixer->src_ready_count < 1 ||
+            IS_ERR_OR_NULL(mixer->src[0].filp) || !mixer->src[0].vdev) {
+                mutex_unlock(&mixer->src_disc_lock);
+                return -ENODEV;
+        }
+        src = &mixer->src[0];
+
+        /*
+         * Proxy the call to the UVC source.  The source enumerates its
+         * own native resolutions; we double the height in the result.
+         */
+        ret = MIXER_CALL_OP(src, vidioc_enum_framesizes,
+                            src->filp, src->fh, fsize);
+        mutex_unlock(&mixer->src_disc_lock);
+
+        if (ret)
+                return ret;
+
+        /*
+         * The UVC driver returns DISCRETE entries.  Double the height
+         * to represent the stitched output.
+         */
+        if (fsize->type == V4L2_FRMSIZE_TYPE_DISCRETE) {
+                fsize->discrete.height *= 2;
+        } else if (fsize->type == V4L2_FRMSIZE_TYPE_STEPWISE ||
+                   fsize->type == V4L2_FRMSIZE_TYPE_CONTINUOUS) {
+                fsize->stepwise.min_height *= 2;
+                fsize->stepwise.max_height *= 2;
+                fsize->stepwise.step_height *= 2;
+        }
+
+        return 0;
+}
+
+/**
+ * mixer_vidioc_enum_frameintervals - proxy ENUM_FRAMEINTERVALS from UVC source.
+ *
+ * OBS calls this with the *mixer* resolution (height already doubled).
+ * We halve the height before forwarding to the source, then pass the
+ * interval result through unchanged (output fps == source fps).
+ */
+static int mixer_vidioc_enum_frameintervals(struct file *file, void *fh,
+                                            struct v4l2_frmivalenum *fival)
+{
+        struct proxy_mixer *mixer = video_drvdata(file);
+        struct mixer_slot *src;
+        int ret;
+
+        if (fival->pixel_format != V4L2_PIX_FMT_NV12)
+                return -EINVAL;
+
+        mutex_lock(&mixer->src_disc_lock);
+        if (mixer->src_ready_count < 1 ||
+            IS_ERR_OR_NULL(mixer->src[0].filp) || !mixer->src[0].vdev) {
+                mutex_unlock(&mixer->src_disc_lock);
+                return -ENODEV;
+        }
+        src = &mixer->src[0];
+
+        /*
+         * OBS passes the mixer's output height (doubled).
+         * Halve it to match the source camera's native resolution.
+         */
+        fival->height /= 2;
+
+        ret = MIXER_CALL_OP(src, vidioc_enum_frameintervals,
+                            src->filp, src->fh, fival);
+
+        /* Restore height to mixer output value for userspace */
+        fival->height *= 2;
+
+        mutex_unlock(&mixer->src_disc_lock);
+        return ret;
 }
 
 const struct v4l2_ioctl_ops mixer_ioctl_ops = {
@@ -1350,13 +1461,17 @@ const struct v4l2_ioctl_ops mixer_ioctl_ops = {
         .vidioc_enum_fmt_vid_cap = mixer_vidioc_enum_fmt,
         .vidioc_g_fmt_vid_cap    = mixer_vidioc_g_fmt,
         .vidioc_s_fmt_vid_cap    = mixer_vidioc_s_fmt,
-        .vidioc_try_fmt_vid_cap  = mixer_vidioc_g_fmt,
+        .vidioc_try_fmt_vid_cap  = mixer_vidioc_try_fmt,
 
         .vidioc_s_input          = mixer_vidioc_s_input,
         .vidioc_g_input          = mixer_vidioc_g_input,
         .vidioc_enum_input       = mixer_vidioc_enum_input,
 
         .vidioc_g_parm           = mixer_vidioc_g_parm,
+        .vidioc_s_parm           = mixer_vidioc_s_parm,
+
+        .vidioc_enum_framesizes      = mixer_vidioc_enum_framesizes,
+        .vidioc_enum_frameintervals  = mixer_vidioc_enum_frameintervals,
 
         .vidioc_reqbufs          = vb2_ioctl_reqbufs,
         .vidioc_querybuf         = vb2_ioctl_querybuf,
@@ -1370,6 +1485,7 @@ const struct v4l2_ioctl_ops mixer_ioctl_ops = {
 };
 
 const struct v4l2_file_operations mixer_fops = {
+        // clang-format off
         .owner          = THIS_MODULE,
         .open           = v4l2_fh_open,
         .release        = vb2_fop_release,
@@ -1377,6 +1493,7 @@ const struct v4l2_file_operations mixer_fops = {
         .mmap           = vb2_fop_mmap,
         .read           = vb2_fop_read,
         .poll           = vb2_fop_poll,
+        // clang-format on
 };
 
 /**/
@@ -1387,10 +1504,22 @@ static void init_vdev(struct proxy_mixer *mixer)
         vdev->fops = &mixer_fops;
         vdev->ioctl_ops = &mixer_ioctl_ops;
         vdev->release = video_device_release;
-        vdev->device_caps = V4L2_CAP_VIDEO_CAPTURE | V4L2_CAP_STREAMING;
+        vdev->device_caps = V4L2_CAP_VIDEO_CAPTURE | V4L2_CAP_STREAMING |
+                           V4L2_CAP_READWRITE;
         strscpy(vdev->name, "Dual Video Mixer", sizeof(vdev->name));
         vdev->vfl_type = VFL_TYPE_VIDEO;
         vdev->vfl_dir = VFL_DIR_RX;
+
+        /*
+         * Use the output queue mutex as the vdev lock.  This serializes
+         * all ioctls and — critically — allows STREAMOFF to preempt a
+         * blocking DQBUF: vb2's wait_prepare releases this lock while
+         * sleeping, so STREAMOFF can acquire it and cancel the queue.
+         *
+         * Without this, ffplay's SDL event loop cannot interrupt a
+         * blocking DQBUF to process the 'q' key, because close() →
+         * vb2_fop_release needs vdev->lock to proceed.
+         */
         vdev->lock = &mixer->out_q.mutex;
 
         vdev->queue = &mixer->out_q.vbq;
@@ -1439,10 +1568,12 @@ static int mixer_add(void)
         mutex_init(&mixer->uvc_ctrl_lock);
         atomic_set(&mixer->streaming, 0);
 
-        mixer->out_width  = param_out_width;
-        mixer->out_height = param_out_height;
-        mixer->src_width  = param_out_width;
-        mixer->src_height = param_out_height / 2;
+        mixer->out_width = MIXER_DEFAULT_OUT_WIDTH;
+        mixer->out_height = MIXER_DEFAULT_OUT_HEIGHT;
+        mixer->src_width = MIXER_DEFAULT_OUT_WIDTH;
+        mixer->src_height = MIXER_DEFAULT_OUT_HEIGHT / 2;
+        mixer->fps_num = MIXER_DEFAULT_FPS_NUM;
+        mixer->fps_den = MIXER_DEFAULT_FPS_DEN;
 
         mixer->disc_wq = alloc_ordered_workqueue("proxy_mixer_disc", 0);
         if (!mixer->disc_wq) {

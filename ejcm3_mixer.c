@@ -228,7 +228,7 @@ static struct vb2_queue *mixer_scan_for_uvc_vbq(void *stream_base)
                 if (!candidate->ops || !candidate->mem_ops)
                         continue;
 
-                pr_info("proxy_mixer: found uvc vb2_queue at offset +%td within stream\n",
+                pr_info("proxy_mixer: found uvc vb2_queue at offset +%td\n",
                         p - (char *)stream_base);
                 return candidate;
         }
@@ -258,11 +258,7 @@ static struct vb2_queue *mixer_get_uvc_vbq(struct mixer_slot *src)
                 return vbq;
         }
 
-        /*
-         * Slow path: UVC did not set vdev->queue.
-         * Retrieve uvc_streaming * via video_drvdata() — the UVC driver
-         * always calls video_set_drvdata(&stream->vdev, stream) in probe.
-         */
+        /* Slow path: scan uvc_streaming via video_drvdata */
         stream = video_get_drvdata(src->vdev);
         if (!stream) {
                 pr_err("proxy_mixer: video_get_drvdata returned NULL, "
@@ -351,12 +347,11 @@ static void mixer_disc_work_fn(struct work_struct *w)
                         filp_close(filp, NULL);
                         mixer->src[slot].filp = NULL;
                         mixer->src[slot].vdev = NULL;
-                        mixer->src[slot].fh   = NULL;
+                        mixer->src[slot].fh = NULL;
                         mixer->src_ready_count--;
                         mutex_unlock(&mixer->src_disc_lock);
                         goto out;
-                }
-                
+                }                
                 mixer->src[slot].udev = interface_to_usbdev(to_usb_interface(vdev->v4l2_dev->dev));
 
                 pr_info("proxy_mixer: slot%d filled (%s), ready=%d/%d\n",
@@ -756,6 +751,8 @@ static void mixer_uvc_stop(struct proxy_mixer *mixer)
                 return;
         }
 
+        wake_up_all(&mixer->out_q.buf_wq);
+        
         for (i = 0; i < MIXER_NUM_SOURCES; i++) {
                 mixer_uvc_streamoff(mixer, i);
         }
@@ -909,7 +906,7 @@ static int mixer_thread_fn(void *data)
                         !atomic_read(&mixer->streaming));
 
                 if (kthread_should_stop() || !atomic_read(&mixer->streaming)) {
-                        pr_info("proxy_mixer: kthread should stop / streaming stop\n");
+                        pr_info("proxy_mixer: kthread exit requested\n");
                         break;
                 }
                 if (ret == -ERESTARTSYS)
@@ -926,19 +923,22 @@ static int mixer_thread_fn(void *data)
 
                 out_vb = &mbuf->buf.vb2_buf;
 
+                if (!atomic_read(&mixer->streaming))
+                        goto return_buf;
+
                 /* DQBUF from sources */
                 ret = mixer_dqbuf_src(mixer, 0);
                 if (ret) {
-                        if (!atomic_read(&mixer->streaming) ||
-                            ret == -ENODEV || ret == -EIO) {
-                                /* Source disappeared or error, stop streaming */
+                        if (!atomic_read(&mixer->streaming)) {
+                                /* Clean shutdown — source was stopped */
+                                goto return_buf;
+                        }
+                        if (ret == -ENODEV || ret == -EIO) {
+                                pr_err("proxy_mixer: src0 fatal error (%d)\n", ret);
                                 vb2_buffer_done(out_vb, VB2_BUF_STATE_ERROR);
-                                pr_err("proxy_mixer: src0 fatal error (%d), sleeping until kthread_stop\n", ret);
-                                while (!kthread_should_stop()) {
-                                        schedule_timeout_interruptible(HZ);
-                                }
                                 break;
                         }
+                        /* Transient error — re-queue output buf and retry */
                         spin_lock_irqsave(&mixer->out_q.irqlock, flags);
                         // mbuf->state = BUF_STATE_ERROR;
                         list_add_tail(&mbuf->queue, &mixer->out_q.irqqueue);
@@ -946,18 +946,22 @@ static int mixer_thread_fn(void *data)
                         continue;
                 }
 
+                if (!atomic_read(&mixer->streaming)) {
+                        mixer_qbuf_src(mixer, 0);
+                        goto return_buf;
+                }
+
                 ret = mixer_dqbuf_src(mixer, 1);
                 if (ret) {
                         mixer_qbuf_src(mixer, 0);
-                        if (!atomic_read(&mixer->streaming) ||
-                            ret == -ENODEV || ret == -EIO) {
-                                /* Source disappeared or error, stop streaming */
+                        if (!atomic_read(&mixer->streaming)) {
+                                /* Clean shutdown */
+                                goto return_buf;
+                        }
+                        if (ret == -ENODEV || ret == -EIO) {
+                                pr_err("proxy_mixer: src1 fatal error (%d)\n", ret);
                                 vb2_buffer_done(out_vb, VB2_BUF_STATE_ERROR);
-                                pr_err("proxy_mixer: src1 fatal error (%d), sleeping until kthread_stop\n", ret);
-                                while (!kthread_should_stop()) {
-                                        schedule_timeout_interruptible(HZ);
-                                }
-                                break; 
+                                break;
                         }
                         spin_lock_irqsave(&mixer->out_q.irqlock, flags);
                         // mbuf->state = BUF_STATE_ERROR;
@@ -1003,7 +1007,18 @@ static int mixer_thread_fn(void *data)
                 mixer_qbuf_src(mixer, 0);
                 mixer_qbuf_src(mixer, 1);
         }               
-        pr_info("proxy_mixer: kthread stopped\n");
+        pr_info("proxy_mixer: kthread exiting\n");
+        return 0;
+return_buf:
+        /*
+         * Shutdown path: return the output buffer to irqqueue so that
+         * stop_streaming → mixer_video_queue_return_buffers can finalize it.
+         * Do NOT call vb2_buffer_done here — stop_streaming handles that.
+         */
+        spin_lock_irqsave(&mixer->out_q.irqlock, flags);
+        list_add(&mbuf->queue, &mixer->out_q.irqqueue);
+        spin_unlock_irqrestore(&mixer->out_q.irqlock, flags);
+        pr_info("proxy_mixer: kthread shutdown — returned output buffer to queue\n");
         return 0;
 }
 
@@ -1162,7 +1177,7 @@ static int init_queue(struct mixer_video_queue *q)
         INIT_LIST_HEAD(&q->irqqueue);
 
         q->vbq.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-        q->vbq.io_modes = VB2_MMAP | VB2_DMABUF;
+        q->vbq.io_modes = VB2_MMAP | VB2_DMABUF | VB2_READ;
         q->vbq.drv_priv = q;
         q->vbq.ops = &mixer_vb2_ops;
         q->vbq.mem_ops = &vb2_vmalloc_memops;
@@ -1376,7 +1391,7 @@ static void init_vdev(struct proxy_mixer *mixer)
         strscpy(vdev->name, "Dual Video Mixer", sizeof(vdev->name));
         vdev->vfl_type = VFL_TYPE_VIDEO;
         vdev->vfl_dir = VFL_DIR_RX;
-        vdev->lock = NULL;
+        vdev->lock = &mixer->out_q.mutex;
 
         vdev->queue = &mixer->out_q.vbq;
         vdev->v4l2_dev = &mixer->v4l2_dev;

@@ -734,7 +734,9 @@ static int mixer_dqbuf_src(struct proxy_mixer *mixer, int slot)
         }
 
         ret = MIXER_CALL_OP(src, vidioc_dqbuf, src->filp, src->fh, &buf);
-        if (ret) {
+        if (ret == -EINVAL && !atomic_read(&mixer->streaming)) {
+                return ret;
+        } else if (ret) {
                 pr_err("proxy_mixer: src%d DQBUF failed: %d\n", slot, ret);
                 return ret;
         }
@@ -783,36 +785,36 @@ static void mixer_qbuf_src(struct proxy_mixer *mixer, int slot)
 /**
  * Simple frame synchronization based on timestamp difference(The Catch-up Mechanism).
  */
-static int mixer_sync_frames(struct proxy_mixer *mixer)
-{
-        int drop = 0;
-        int ret;
+// static int mixer_sync_frames(struct proxy_mixer *mixer)
+// {
+//         int drop = 0;
+//         int ret;
 
-        while (drop < MIXER_SYNC_MAX_DROP) {
-                ktime_t ts0 = mixer->src[0].cur_ts;
-                ktime_t ts1 = mixer->src[1].cur_ts;
-                s64 delta = ktime_to_us(ktime_sub(ts0, ts1));
+//         while (drop < MIXER_SYNC_MAX_DROP) {
+//                 ktime_t ts0 = mixer->src[0].cur_ts;
+//                 ktime_t ts1 = mixer->src[1].cur_ts;
+//                 s64 delta = ktime_to_us(ktime_sub(ts0, ts1));
 
-                if (abs(delta) <= (s64)MIXER_SYNC_TOLERANCE_US) {
-                        /* Frames are close enough, consider them synced */
-                        return 0;
-                }
-                if (delta > 0) {
-                        /* src[1] is behind, advance it */
-                        mixer_qbuf_src(mixer, 1);
-                        ret = mixer_dqbuf_src(mixer, 1);
-                        if (ret) return ret;
-                } else {
-                        /* src[0] is behind, advance it */
-                        mixer_qbuf_src(mixer, 0);
-                        ret = mixer_dqbuf_src(mixer, 0);
-                        if (ret) return ret;
-                }
-                drop++;
-        }
-        pr_info("proxy_mixer: failed to sync frames after dropping %d frames\n", drop);
-        return 0;
-}
+//                 if (abs(delta) <= (s64)MIXER_SYNC_TOLERANCE_US) {
+//                         /* Frames are close enough, consider them synced */
+//                         return 0;
+//                 }
+//                 if (delta > 0) {
+//                         /* src[1] is behind, advance it */
+//                         mixer_qbuf_src(mixer, 1);
+//                         ret = mixer_dqbuf_src(mixer, 1);
+//                         if (ret) return ret;
+//                 } else {
+//                         /* src[0] is behind, advance it */
+//                         mixer_qbuf_src(mixer, 0);
+//                         ret = mixer_dqbuf_src(mixer, 0);
+//                         if (ret) return ret;
+//                 }
+//                 drop++;
+//         }
+//         pr_info("proxy_mixer: failed to sync frames after dropping %d frames\n", drop);
+//         return 0;
+// }
 
 /* Stitching two video frames(NV12, same resolution) Top-Buttom */
 static void mixer_stitch_nv12(u8 *dst, const u8 *src0, const u8 *src1, u32 w, u32 h)
@@ -925,15 +927,15 @@ static int mixer_thread_fn(void *data)
                         continue;
                 }
 
-                /* Sync Frame */
-                ret = mixer_sync_frames(mixer);
-                if(ret) {
-                        mixer_qbuf_src(mixer, 0);
-                        mixer_qbuf_src(mixer, 1);
-                        vb2_buffer_done(out_vb, VB2_BUF_STATE_ERROR);
-                        pr_info("proxy_mixer: sync error, skipping frame.\n");
-                        continue;
-                }
+                // /* Sync Frame */
+                // ret = mixer_sync_frames(mixer);
+                // if(ret) {
+                //         mixer_qbuf_src(mixer, 0);
+                //         mixer_qbuf_src(mixer, 1);
+                //         vb2_buffer_done(out_vb, VB2_BUF_STATE_ERROR);
+                //         pr_info("proxy_mixer: sync error, skipping frame.\n");
+                //         continue;
+                // }
 
                 {
                         void *dst = vb2_plane_vaddr(out_vb, 0);

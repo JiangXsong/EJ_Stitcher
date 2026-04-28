@@ -13,7 +13,7 @@
 #   make clean           Remove build artefacts
 # ────────────────────────────────────────────────────────────────────────────
 
-MODULE_NAME := proxy_mixer
+MODULE_NAME := ej_video_stitch
 
 # --- Object list ------------------------------------------------------------
 $(MODULE_NAME)-y := ejcm3_mixer.o

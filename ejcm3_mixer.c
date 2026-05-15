@@ -32,12 +32,14 @@
  * callers must ensure the source filp/vdev remain valid (protected by
  * src_disc_lock or uvc_ctrl_lock as appropriate).
  */
-#define MIXER_CALL_OP(src, op, ...)                                   \
-	({                                                            \
+#define MIXER_CALL_OP(src, op, ...)                           \
+	({                                                        \
 		int __ret = -ENOTTY;                                  \
 		struct video_device *__vd = (src)->vdev;              \
 		if (__vd && __vd->ioctl_ops && __vd->ioctl_ops->op) { \
-			__ret = __vd->ioctl_ops->op(__VA_ARGS__);     \
+            if (__vd->lock) mutex_lock(__vd->lock);           \
+			__ret = __vd->ioctl_ops->op(__VA_ARGS__);         \
+            if (__vd->lock) mutex_unlock(__vd->lock);         \
 		}                                                     \
 		__ret;                                                \
 	})
@@ -164,7 +166,7 @@ static void mixer_queue_release(struct mixer_video_queue *q);
 #define MIXER_DEFAULT_OUT_WIDTH 3840
 #define MIXER_DEFAULT_OUT_HEIGHT 2160
 #define MIXER_DEFAULT_FPS_NUM 1
-#define MIXER_DEFAULT_FPS_DEN 30
+#define MIXER_DEFAULT_FPS_DEN 60
 
 static struct proxy_mixer *g_mixer;
 
@@ -239,6 +241,10 @@ static void mixer_disc_work_fn(struct work_struct *w)
 		container_of(w, struct mixer_disc_work, work);
 	struct proxy_mixer *mixer = dw->mixer;
 	struct video_device *vdev = dw->vdev;
+    struct device *intf_dev;
+	struct usb_interface *intf;
+	struct usb_device *udev;
+	u16 pid;
 	char devpath[32];
 	struct file *filp;
 	int slot = -1;
@@ -246,6 +252,11 @@ static void mixer_disc_work_fn(struct work_struct *w)
 
 	if (dw->is_add) {
 		/* ADD */
+        intf_dev = vdev->v4l2_dev->dev;
+        intf = to_usb_interface(intf_dev);
+	    udev = interface_to_usbdev(intf);
+        pid = le16_to_cpu(udev->descriptor.idProduct);
+
 		mutex_lock(&mixer->src_disc_lock);
 
 		/* Ignore if all slots are filled */
@@ -254,13 +265,15 @@ static void mixer_disc_work_fn(struct work_struct *w)
 			goto out;
 		}
 
-		/* find empty slot */
-		for (i = 0; i < MIXER_NUM_SOURCES; i++) {
-			if (!mixer->src[i].filp) {
-				slot = i;
-				break;
+        if (pid == MIXER_DEFAULT_PID_P) {
+            if (!mixer->src[0].filp) {
+				slot = 0;
 			}
-		}
+        } else if (pid == MIXER_DEFAULT_PID_S) {
+            if (!mixer->src[1].filp) {
+				slot = 1;
+			}
+        }
 
 		if (slot < 0) {
 			mutex_unlock(&mixer->src_disc_lock);
@@ -310,13 +323,8 @@ static void mixer_disc_work_fn(struct work_struct *w)
 		pr_info("proxy_mixer: slot%d filled (%s), ready=%d/%d\n", slot,
 			devpath, mixer->src_ready_count, MIXER_NUM_SOURCES);
 		mutex_unlock(&mixer->src_disc_lock);
-		/**
-         * Pipeline is NOT started here.
-         * It is started on VIDIOC_STREAMON from userspace.
-         */
 	} else {
 		/* REMOVE */
-
 		/**
          * Stop the pipeline first so the kthread is no longer
          * accessing src[]. mixer_uvc_stop is idempotent (protected
@@ -828,73 +836,9 @@ static void mixer_qbuf_src(struct proxy_mixer *mixer, int slot)
 	src->buf_ready = false;
 }
 
-/**
- * Simple frame synchronization based on timestamp difference(The Catch-up Mechanism).
- */
-static int mixer_sync_frames(struct proxy_mixer *mixer)
-{
-	int drop = 0;
-	int ret;
-
-	while (drop < MIXER_SYNC_MAX_DROP) {
-		ktime_t ts0 = mixer->src[0].cur_ts;
-		ktime_t ts1 = mixer->src[1].cur_ts;
-		s64 delta = ktime_to_us(ktime_sub(ts0, ts1));
-
-		if (abs(delta) <= (s64)MIXER_SYNC_TOLERANCE_US) {
-			/* Frames are close enough, consider them synced */
-			return 0;
-		}
-		if (delta > 0) {
-			/* src[1] is behind, advance it */
-			mixer_qbuf_src(mixer, 1);
-			ret = mixer_dqbuf_src(mixer, 1);
-			if (ret)
-				return ret;
-		} else {
-			/* src[0] is behind, advance it */
-			mixer_qbuf_src(mixer, 0);
-			ret = mixer_dqbuf_src(mixer, 0);
-			if (ret)
-				return ret;
-		}
-		drop++;
-	}
-	pr_info("proxy_mixer: failed to sync frames after dropping %d frames\n",
-		drop);
-	return 0;
-}
-
-// /* Stitching two video frames(NV12, same resolution) Top-Buttom */
-// static void mixer_stitch_nv12(u8 *dst, const u8 *src0, const u8 *src1, u32 w,
-// 			      u32 h)
-// {
-// 	u64 size_y = (u64)w * h;
-// 	u64 size_uv = size_y / 2;
-
-// 	const u8 *src0_y = src0;
-// 	const u8 *src0_uv = src0 + size_y;
-// 	const u8 *src1_y = src1;
-// 	const u8 *src1_uv = src1 + size_y;
-
-// 	u8 *dst_y_part0 = dst;
-// 	u8 *dst_y_part1 = dst + size_y;
-// 	u8 *dst_uv_part0 = dst_y_part1 + size_y;
-// 	u8 *dst_uv_part1 = dst_uv_part0 + size_uv;
-
-// 	/* Stitch the Y planes */
-// 	memcpy(dst_y_part0, src0_y, size_y);
-// 	memcpy(dst_y_part1, src1_y, size_y);
-
-// 	/* Stitch the UV planes */
-// 	memcpy(dst_uv_part0, src0_uv, size_uv);
-// 	memcpy(dst_uv_part1, src1_uv, size_uv);
-// }
-
 static void mixer_stitch_half_raw(u8 *dst, const u8 *src0, const u8 *src1,
 				  u64 raw_size)
 {
-	/* Directory stitch two raw datas, assuming NV12 format current. */
 	u8 *dst_frame_top = dst;
 	u8 *dst_frame_bottom = dst + raw_size;
 
@@ -998,16 +942,6 @@ static int mixer_thread_fn(void *data)
 			continue;
 		}
 
-		// /* Sync Frame */
-		ret = mixer_sync_frames(mixer);
-		if (ret) {
-			mixer_qbuf_src(mixer, 0);
-			mixer_qbuf_src(mixer, 1);
-			vb2_buffer_done(out_vb, VB2_BUF_STATE_ERROR);
-			pr_info("proxy_mixer: sync error, skipping frame.\n");
-			continue;
-		}
-
 		{
 			void *dst = vb2_plane_vaddr(out_vb, 0);
 			void *src0 = mixer->src[0].cur_vb ?
@@ -1028,10 +962,6 @@ static int mixer_thread_fn(void *data)
 
 			src_data_size = (u64)mixer_image_size(
 				mixer->src_width, mixer->src_height, pixfmt);
-
-			/* Stitch frames and copy to output buffer */
-			// mixer_stitch_nv12(dst, src0, src1, mixer->src_width,
-			// 		  mixer->src_height);
 
 			mixer_stitch_half_raw(dst, src0, src1, src_data_size);
 		}
@@ -1208,14 +1138,9 @@ const struct vb2_ops mixer_vb2_ops = {
 	// clang-format on
 };
 
-/**
- * 
- */
 static void mixer_queue_release(struct mixer_video_queue *q)
 {
-	// mutex_lock(&q->mutex);
 	vb2_queue_release(&q->vbq);
-	// mutex_unlock(&q->mutex);
 }
 
 static int init_queue(struct mixer_video_queue *q)
@@ -1360,8 +1285,7 @@ static int mixer_vidioc_s_fmt(struct file *file, void *fh,
 
 	if (fmt->fmt.pix.width > 0 && fmt->fmt.pix.height >= 2) {
 		mixer->out_width = fmt->fmt.pix.width;
-		mixer->out_height = fmt->fmt.pix.height &
-				    ~1u; /* round down to even */
+		mixer->out_height = fmt->fmt.pix.height & ~1u; /* round down to even */
 		mixer->src_width = mixer->out_width;
 		mixer->src_height = mixer->out_height / 2;
 		pr_info("proxy_mixer: s_fmt accepted %ux%u fmt=0x%X (src %ux%u)\n",
@@ -1388,7 +1312,6 @@ static int mixer_vidioc_try_fmt(struct file *file, void *fh,
 			 fmt->fmt.pix.pixelformat :
 			 V4L2_PIX_FMT_YUYV;
 
-	/* Only NV12 supported */
 	fmt->fmt.pix.pixelformat = pixfmt;
 	fmt->fmt.pix.field = V4L2_FIELD_NONE;
 	fmt->fmt.pix.colorspace = V4L2_COLORSPACE_SRGB;

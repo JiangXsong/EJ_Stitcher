@@ -240,8 +240,8 @@ static void mixer_disc_work_fn(struct work_struct *w)
 		mutex_unlock(&mixer->src_disc_lock);
 
 		/**
-                 *  filp_open - Open without O_NONBLOCK. 
-                 */
+         *  filp_open - Open without O_NONBLOCK. 
+         */
 		snprintf(devpath, sizeof(devpath), "/dev/video%d", vdev->num);
 
 		filp = filp_open(devpath, O_RDWR, 0);
@@ -278,17 +278,17 @@ static void mixer_disc_work_fn(struct work_struct *w)
 			devpath, mixer->src_ready_count, MIXER_NUM_SOURCES);
 		mutex_unlock(&mixer->src_disc_lock);
 		/**
-                 * Pipeline is NOT started here.
-                 * It is started on VIDIOC_STREAMON from userspace.
-                 */
+         * Pipeline is NOT started here.
+         * It is started on VIDIOC_STREAMON from userspace.
+         */
 	} else {
 		/* REMOVE */
 
 		/**
-                 * Stop the pipeline first so the kthread is no longer
-                 * accessing src[]. mixer_uvc_stop is idempotent (protected
-                 * by atomic_cmpxchg).
-                 */
+         * Stop the pipeline first so the kthread is no longer
+         * accessing src[]. mixer_uvc_stop is idempotent (protected
+         * by atomic_cmpxchg).
+         */
 		// mutex_lock(&mixer->uvc_ctrl_lock);
 		if (atomic_read(&mixer->streaming))
 			mixer_uvc_stop(mixer);
@@ -433,30 +433,30 @@ static int mixer_register_class_intf(struct proxy_mixer *mixer,
 				     const struct class *vcls)
 {
 	/**
-         * Three options to get vcls (video_class):
-         * 1. Get from an existing video_device (e.g., mixer->vdev->dev.class).
-         * 2. kallsyms_lookup_name("video_class") to get the pointer to video_class.
-         * 3. Export video_class from v4l2-dev.c and directly extern it here.
-         * 
-         * --
-         * 1. is the most straightforward.
-         *    - It requires mixer->vdev to be registered before registering class interface, 
-         * 2. is a bit hacky but works without modifying v4l2-core. 
-         *    - It requires CONFIG_KALLSYMS=y and may not be future-proof if symbol names change.
-         * 3. is the cleanest and most future-proof, but it requires modifying v4l2-core to export video_class.
-         *    - Add patch in v4l2-dev.c: EXPORT_SYMBOL(video_class);
-         * --
-         */
+     * Three options to get vcls (video_class):
+     * 1. Get from an existing video_device (e.g., mixer->vdev->dev.class).
+     * 2. kallsyms_lookup_name("video_class") to get the pointer to video_class.
+     * 3. Export video_class from v4l2-dev.c and directly extern it here.
+     * 
+     * --
+     * 1. is the most straightforward.
+     *    - It requires mixer->vdev to be registered before registering class interface, 
+     * 2. is a bit hacky but works without modifying v4l2-core. 
+     *    - It requires CONFIG_KALLSYMS=y and may not be future-proof if symbol names change.
+     * 3. is the cleanest and most future-proof, but it requires modifying v4l2-core to export video_class.
+     *    - Add patch in v4l2-dev.c: EXPORT_SYMBOL(video_class);
+     * --
+     */
 	mixer->class_intf.class = vcls;
 	mixer->class_intf.add_dev = mixer_class_add_dev;
 	mixer->class_intf.remove_dev = mixer_class_remove_dev;
 
 	/**
-         * class_interface_register - Registers a class 
-         * 
-         * The add_dev callback will be called for each existing device in the class, 
-         * and then for each new device that gets added to the class.
-         */
+     * class_interface_register - Registers a class 
+     * 
+     * The add_dev callback will be called for each existing device in the class, 
+     * and then for each new device that gets added to the class.
+     */
 	return class_interface_register(&mixer->class_intf);
 }
 
@@ -492,7 +492,7 @@ static int mixer_uvc_negotiate_src_fmt(struct proxy_mixer *mixer, int slot)
 	src->fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
 	src->fmt.fmt.pix.width = mixer->src_width;
 	src->fmt.fmt.pix.height = mixer->src_height;
-	src->fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_NV12;
+	src->fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_YUYV;
 	src->fmt.fmt.pix.field = V4L2_FIELD_NONE;
 
 	ret = MIXER_CALL_OP(src, vidioc_s_fmt_vid_cap, src->filp, src->fh,
@@ -829,30 +829,42 @@ static int mixer_sync_frames(struct proxy_mixer *mixer)
         return 0;
 }
 
-/* Stitching two video frames(NV12, same resolution) Top-Buttom */
-static void mixer_stitch_nv12(u8 *dst, const u8 *src0, const u8 *src1, u32 w,
-			      u32 h)
+// /* Stitching two video frames(NV12, same resolution) Top-Buttom */
+// static void mixer_stitch_nv12(u8 *dst, const u8 *src0, const u8 *src1, u32 w,
+// 			      u32 h)
+// {
+// 	u64 size_y = (u64)w * h;
+// 	u64 size_uv = size_y / 2;
+
+// 	const u8 *src0_y = src0;
+// 	const u8 *src0_uv = src0 + size_y;
+// 	const u8 *src1_y = src1;
+// 	const u8 *src1_uv = src1 + size_y;
+
+// 	u8 *dst_y_part0 = dst;
+// 	u8 *dst_y_part1 = dst + size_y;
+// 	u8 *dst_uv_part0 = dst_y_part1 + size_y;
+// 	u8 *dst_uv_part1 = dst_uv_part0 + size_uv;
+
+// 	/* Stitch the Y planes */
+// 	memcpy(dst_y_part0, src0_y, size_y);
+// 	memcpy(dst_y_part1, src1_y, size_y);
+
+// 	/* Stitch the UV planes */
+// 	memcpy(dst_uv_part0, src0_uv, size_uv);
+// 	memcpy(dst_uv_part1, src1_uv, size_uv);
+// }
+
+static void mixer_stitch_half_raw(u8 *dst, const u8 *src0, const u8 *src1, u32 w, u32 h)
 {
-	u64 size_y = (u64)w * h;
-	u64 size_uv = size_y / 2;
+    /* Directory stitch two raw datas, assuming NV12 format current. */
+    u64 size_half = (u64)w * h * 2;
 
-	const u8 *src0_y = src0;
-	const u8 *src0_uv = src0 + size_y;
-	const u8 *src1_y = src1;
-	const u8 *src1_uv = src1 + size_y;
+    u8 *dst_frame_top = dst;
+    u8 *dst_frame_bottom = dst + size_half;
 
-	u8 *dst_y_part0 = dst;
-	u8 *dst_y_part1 = dst + size_y;
-	u8 *dst_uv_part0 = dst_y_part1 + size_y;
-	u8 *dst_uv_part1 = dst_uv_part0 + size_uv;
-
-	/* Stitch the Y planes */
-	memcpy(dst_y_part0, src0_y, size_y);
-	memcpy(dst_y_part1, src1_y, size_y);
-
-	/* Stitch the UV planes */
-	memcpy(dst_uv_part0, src0_uv, size_uv);
-	memcpy(dst_uv_part1, src1_uv, size_uv);
+    memcpy(dst_frame_top, src0, size_half);
+    memcpy(dst_frame_bottom, src1, size_half);
 }
 
 static int mixer_thread_fn(void *data)
@@ -892,12 +904,12 @@ static int mixer_thread_fn(void *data)
 		out_vb = &mbuf->buf.vb2_buf;
 
 		/*
-                 * Check streaming flag before each blocking DQBUF.
-                 * mixer_uvc_stop() sets streaming=0 then streamoffs sources;
-                 * if we see 0 here, sources may already be stopped so DQBUF
-                 * would return -EINVAL.  Return the output buffer to the
-                 * queue and let stop_streaming clean it up.
-                 */
+         * Check streaming flag before each blocking DQBUF.
+         * mixer_uvc_stop() sets streaming=0 then streamoffs sources;
+         * if we see 0 here, sources may already be stopped so DQBUF
+         * would return -EINVAL.  Return the output buffer to the
+         * queue and let stop_streaming clean it up.
+         */
 		if (!atomic_read(&mixer->streaming))
 			goto return_buf;
 
@@ -974,13 +986,15 @@ static int mixer_thread_fn(void *data)
 			}
 
 			/* Stitch frames and copy to output buffer */
-			mixer_stitch_nv12(dst, src0, src1, mixer->src_width,
-					  mixer->src_height);
+			// mixer_stitch_nv12(dst, src0, src1, mixer->src_width,
+			// 		  mixer->src_height);
+
+            mixer_stitch_half_raw(dst, src0, src1, mixer->src_width, mixer->src_height);
 		}
 
 		vb2_set_plane_payload(out_vb, 0,
 				      (size_t)mixer->out_width *
-					      mixer->out_height * 3 / 2);
+					      mixer->out_height * 2);
 		out_vb->timestamp = ktime_get_ns();
 		vb2_buffer_done(out_vb, VB2_BUF_STATE_DONE);
 
@@ -993,10 +1007,10 @@ static int mixer_thread_fn(void *data)
 
 return_buf:
 	/*
-         * Shutdown path: return the output buffer to irqqueue so that
-         * stop_streaming → mixer_video_queue_return_buffers can finalize it.
-         * Do NOT call vb2_buffer_done here — stop_streaming handles that.
-         */
+     * Shutdown path: return the output buffer to irqqueue so that
+     * stop_streaming → mixer_video_queue_return_buffers can finalize it.
+     * Do NOT call vb2_buffer_done here — stop_streaming handles that.
+     */
 	spin_lock_irqsave(&mixer->out_q.irqlock, flags);
 	list_add(&mbuf->queue, &mixer->out_q.irqqueue);
 	spin_unlock_irqrestore(&mixer->out_q.irqlock, flags);
@@ -1026,7 +1040,7 @@ static int mixer_queue_setup(struct vb2_queue *vbq, unsigned int *num_buffers,
 	struct mixer_video_queue *q = vb2_get_drv_priv(vbq);
 	struct proxy_mixer *mixer = container_of(q, struct proxy_mixer, out_q);
 	unsigned int size =
-		mixer->out_width * mixer->out_height * 3 / 2; /* NV12 */
+		mixer->out_width * mixer->out_height * 2; /* NV12 */
 
 	pr_debug("proxy_mixer: queue_setup (nplanes=%d, nbuffers=%d)\n",
 		 *num_planes, *num_buffers);
@@ -1046,7 +1060,7 @@ static int mixer_buf_prepare(struct vb2_buffer *vb)
 	struct mixer_video_queue *q = vb2_get_drv_priv(vb->vb2_queue);
 	struct proxy_mixer *mixer = container_of(q, struct proxy_mixer, out_q);
 	unsigned int size =
-		mixer->out_width * mixer->out_height * 3 / 2; /* NV12 */
+		mixer->out_width * mixer->out_height * 2; /* NV12 */
 
 	pr_debug("proxy_mixer: buf_prepare idx=%d, size requirement=%u\n",
 		 vb->index, size);
@@ -1236,7 +1250,7 @@ static int mixer_vidioc_enum_fmt(struct file *file, void *fh,
 	if (fmtdesc->index != 0 || fmtdesc->type != V4L2_BUF_TYPE_VIDEO_CAPTURE)
 		return -EINVAL;
 
-	fmtdesc->pixelformat = V4L2_PIX_FMT_NV12;
+	fmtdesc->pixelformat = V4L2_PIX_FMT_YUYV;
 	return 0;
 }
 
@@ -1245,10 +1259,10 @@ static void fill_fmt(struct proxy_mixer *mixer, struct v4l2_format *f)
 	mutex_lock(&mixer->lock);
 	f->fmt.pix.width = mixer->out_width;
 	f->fmt.pix.height = mixer->out_height;
-	f->fmt.pix.pixelformat = V4L2_PIX_FMT_NV12;
+	f->fmt.pix.pixelformat = V4L2_PIX_FMT_YUYV;
 	f->fmt.pix.field = V4L2_FIELD_NONE;
 	f->fmt.pix.bytesperline = mixer->out_width;
-	f->fmt.pix.sizeimage = mixer->out_width * mixer->out_height * 3 / 2;
+	f->fmt.pix.sizeimage = mixer->out_width * mixer->out_height * 2;
 	f->fmt.pix.colorspace = V4L2_COLORSPACE_SRGB;
 	mutex_unlock(&mixer->lock);
 }
@@ -1272,7 +1286,7 @@ static int mixer_vidioc_s_fmt(struct file *file, void *fh,
 
 	if (fmt->type != V4L2_BUF_TYPE_VIDEO_CAPTURE)
 		return -EINVAL;
-	if (fmt->fmt.pix.pixelformat != V4L2_PIX_FMT_NV12)
+	if (fmt->fmt.pix.pixelformat != V4L2_PIX_FMT_YUYV)
 		return -EINVAL;
 
 	/*
@@ -1306,7 +1320,7 @@ static int mixer_vidioc_try_fmt(struct file *file, void *fh,
 		return -EINVAL;
 
 	/* Only NV12 supported */
-	fmt->fmt.pix.pixelformat = V4L2_PIX_FMT_NV12;
+	fmt->fmt.pix.pixelformat = V4L2_PIX_FMT_YUYV;
 	fmt->fmt.pix.field = V4L2_FIELD_NONE;
 	fmt->fmt.pix.colorspace = V4L2_COLORSPACE_SRGB;
 
@@ -1322,7 +1336,7 @@ static int mixer_vidioc_try_fmt(struct file *file, void *fh,
 
 	fmt->fmt.pix.bytesperline = fmt->fmt.pix.width;
 	fmt->fmt.pix.sizeimage =
-		fmt->fmt.pix.width * fmt->fmt.pix.height * 3 / 2;
+		fmt->fmt.pix.width * fmt->fmt.pix.height * 2;
 	return 0;
 }
 
@@ -1410,7 +1424,7 @@ static int mixer_vidioc_enum_framesizes(struct file *file, void *fh,
 	int ret;
 
 	/* Only NV12 */
-	if (fsize->pixel_format != V4L2_PIX_FMT_NV12)
+	if (fsize->pixel_format != V4L2_PIX_FMT_YUYV)
 		return -EINVAL;
 
 	mutex_lock(&mixer->src_disc_lock);
@@ -1462,7 +1476,7 @@ static int mixer_vidioc_enum_frameintervals(struct file *file, void *fh,
 	struct mixer_slot *src;
 	int ret;
 
-	if (fival->pixel_format != V4L2_PIX_FMT_NV12)
+	if (fival->pixel_format != V4L2_PIX_FMT_YUYV)
 		return -EINVAL;
 
 	mutex_lock(&mixer->src_disc_lock);

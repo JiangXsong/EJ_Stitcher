@@ -95,7 +95,7 @@ struct proxy_mixer {
 	/* Output format — updated by s_fmt / s_parm */
 	u32 out_width;
 	u32 out_height;
-    u32 out_pixfmt;
+	u32 out_pixfmt;
 	/* per-source format (src_height = out_height / 2) */
 	u32 src_width;
 	u32 src_height;
@@ -833,33 +833,36 @@ static void mixer_qbuf_src(struct proxy_mixer *mixer, int slot)
  */
 static int mixer_sync_frames(struct proxy_mixer *mixer)
 {
-        int drop = 0;
-        int ret;
+	int drop = 0;
+	int ret;
 
-        while (drop < MIXER_SYNC_MAX_DROP) {
-                ktime_t ts0 = mixer->src[0].cur_ts;
-                ktime_t ts1 = mixer->src[1].cur_ts;
-                s64 delta = ktime_to_us(ktime_sub(ts0, ts1));
+	while (drop < MIXER_SYNC_MAX_DROP) {
+		ktime_t ts0 = mixer->src[0].cur_ts;
+		ktime_t ts1 = mixer->src[1].cur_ts;
+		s64 delta = ktime_to_us(ktime_sub(ts0, ts1));
 
-                if (abs(delta) <= (s64)MIXER_SYNC_TOLERANCE_US) {
-                        /* Frames are close enough, consider them synced */
-                        return 0;
-                }
-                if (delta > 0) {
-                        /* src[1] is behind, advance it */
-                        mixer_qbuf_src(mixer, 1);
-                        ret = mixer_dqbuf_src(mixer, 1);
-                        if (ret) return ret;
-                } else {
-                        /* src[0] is behind, advance it */
-                        mixer_qbuf_src(mixer, 0);
-                        ret = mixer_dqbuf_src(mixer, 0);
-                        if (ret) return ret;
-                }
-                drop++;
-        }
-        pr_info("proxy_mixer: failed to sync frames after dropping %d frames\n", drop);
-        return 0;
+		if (abs(delta) <= (s64)MIXER_SYNC_TOLERANCE_US) {
+			/* Frames are close enough, consider them synced */
+			return 0;
+		}
+		if (delta > 0) {
+			/* src[1] is behind, advance it */
+			mixer_qbuf_src(mixer, 1);
+			ret = mixer_dqbuf_src(mixer, 1);
+			if (ret)
+				return ret;
+		} else {
+			/* src[0] is behind, advance it */
+			mixer_qbuf_src(mixer, 0);
+			ret = mixer_dqbuf_src(mixer, 0);
+			if (ret)
+				return ret;
+		}
+		drop++;
+	}
+	pr_info("proxy_mixer: failed to sync frames after dropping %d frames\n",
+		drop);
+	return 0;
 }
 
 // /* Stitching two video frames(NV12, same resolution) Top-Buttom */
@@ -888,14 +891,15 @@ static int mixer_sync_frames(struct proxy_mixer *mixer)
 // 	memcpy(dst_uv_part1, src1_uv, size_uv);
 // }
 
-static void mixer_stitch_half_raw(u8 *dst, const u8 *src0, const u8 *src1, u64 raw_size)
+static void mixer_stitch_half_raw(u8 *dst, const u8 *src0, const u8 *src1,
+				  u64 raw_size)
 {
-    /* Directory stitch two raw datas, assuming NV12 format current. */
-    u8 *dst_frame_top = dst;
-    u8 *dst_frame_bottom = dst + raw_size;
+	/* Directory stitch two raw datas, assuming NV12 format current. */
+	u8 *dst_frame_top = dst;
+	u8 *dst_frame_bottom = dst + raw_size;
 
-    memcpy(dst_frame_top, src0, raw_size);
-    memcpy(dst_frame_bottom, src1, raw_size);
+	memcpy(dst_frame_top, src0, raw_size);
+	memcpy(dst_frame_bottom, src1, raw_size);
 }
 
 static int mixer_thread_fn(void *data)
@@ -904,13 +908,13 @@ static int mixer_thread_fn(void *data)
 	struct mixer_buffer *mbuf;
 	struct vb2_buffer *out_vb;
 	unsigned long flags;
-    u64 src_data_size;
-    u32 pixfmt;
+	u64 src_data_size;
+	u32 pixfmt;
 	int ret;
 
 	sched_set_fifo(current);
 
-    mutex_lock(&mixer->lock);
+	mutex_lock(&mixer->lock);
 	pixfmt = mixer->out_pixfmt;
 	mutex_unlock(&mixer->lock);
 
@@ -997,11 +1001,11 @@ static int mixer_thread_fn(void *data)
 		// /* Sync Frame */
 		ret = mixer_sync_frames(mixer);
 		if (ret) {
-		        mixer_qbuf_src(mixer, 0);
-		        mixer_qbuf_src(mixer, 1);
-		        vb2_buffer_done(out_vb, VB2_BUF_STATE_ERROR);
-		        pr_info("proxy_mixer: sync error, skipping frame.\n");
-		        continue;
+			mixer_qbuf_src(mixer, 0);
+			mixer_qbuf_src(mixer, 1);
+			vb2_buffer_done(out_vb, VB2_BUF_STATE_ERROR);
+			pr_info("proxy_mixer: sync error, skipping frame.\n");
+			continue;
 		}
 
 		{
@@ -1021,19 +1025,21 @@ static int mixer_thread_fn(void *data)
 					dst, src0, src1);
 				continue;
 			}
-            
-            src_data_size = (u64)mixer_image_size(mixer->src_width, mixer->src_height, pixfmt);
-            
+
+			src_data_size = (u64)mixer_image_size(
+				mixer->src_width, mixer->src_height, pixfmt);
+
 			/* Stitch frames and copy to output buffer */
 			// mixer_stitch_nv12(dst, src0, src1, mixer->src_width,
 			// 		  mixer->src_height);
 
-            mixer_stitch_half_raw(dst, src0, src1, src_data_size);
+			mixer_stitch_half_raw(dst, src0, src1, src_data_size);
 		}
 
 		vb2_set_plane_payload(out_vb, 0,
-				              mixer_image_size(mixer->out_width, mixer->out_height,
-					          pixfmt));
+				      mixer_image_size(mixer->out_width,
+						       mixer->out_height,
+						       pixfmt));
 		out_vb->timestamp = ktime_get_ns();
 		vb2_buffer_done(out_vb, VB2_BUF_STATE_DONE);
 
@@ -1080,7 +1086,7 @@ static int mixer_queue_setup(struct vb2_queue *vbq, unsigned int *num_buffers,
 	struct proxy_mixer *mixer = container_of(q, struct proxy_mixer, out_q);
 	unsigned int size;
 
-    mutex_lock(&mixer->lock);
+	mutex_lock(&mixer->lock);
 	size = mixer_image_size(mixer->out_width, mixer->out_height,
 				mixer->out_pixfmt);
 	mutex_unlock(&mixer->lock);
@@ -1104,7 +1110,7 @@ static int mixer_buf_prepare(struct vb2_buffer *vb)
 	struct proxy_mixer *mixer = container_of(q, struct proxy_mixer, out_q);
 	unsigned int size;
 
-    mutex_lock(&mixer->lock);
+	mutex_lock(&mixer->lock);
 	size = mixer_image_size(mixer->out_width, mixer->out_height,
 				mixer->out_pixfmt);
 	mutex_unlock(&mixer->lock);
@@ -1317,9 +1323,8 @@ static void fill_fmt(struct proxy_mixer *mixer, struct v4l2_format *f)
 	f->fmt.pix.field = V4L2_FIELD_NONE;
 	f->fmt.pix.bytesperline =
 		mixer_bytesperline(mixer->out_width, mixer->out_pixfmt);
-	f->fmt.pix.sizeimage =
-		mixer_image_size(mixer->out_width, mixer->out_height,
-				 mixer->out_pixfmt);
+	f->fmt.pix.sizeimage = mixer_image_size(
+		mixer->out_width, mixer->out_height, mixer->out_pixfmt);
 	f->fmt.pix.colorspace = V4L2_COLORSPACE_SRGB;
 	mutex_unlock(&mixer->lock);
 }
@@ -1355,7 +1360,8 @@ static int mixer_vidioc_s_fmt(struct file *file, void *fh,
 
 	if (fmt->fmt.pix.width > 0 && fmt->fmt.pix.height >= 2) {
 		mixer->out_width = fmt->fmt.pix.width;
-		mixer->out_height = fmt->fmt.pix.height & ~1u; /* round down to even */
+		mixer->out_height = fmt->fmt.pix.height &
+				    ~1u; /* round down to even */
 		mixer->src_width = mixer->out_width;
 		mixer->src_height = mixer->out_height / 2;
 		pr_info("proxy_mixer: s_fmt accepted %ux%u fmt=0x%X (src %ux%u)\n",
@@ -1373,14 +1379,14 @@ static int mixer_vidioc_try_fmt(struct file *file, void *fh,
 				struct v4l2_format *fmt)
 {
 	struct proxy_mixer *mixer = video_drvdata(file);
-    u32 pixfmt;
+	u32 pixfmt;
 
 	if (fmt->type != V4L2_BUF_TYPE_VIDEO_CAPTURE)
 		return -EINVAL;
 
-    pixfmt = mixer_pixfmt_valid(fmt->fmt.pix.pixelformat)
-			 ? fmt->fmt.pix.pixelformat
-			 : V4L2_PIX_FMT_YUYV;
+	pixfmt = mixer_pixfmt_valid(fmt->fmt.pix.pixelformat) ?
+			 fmt->fmt.pix.pixelformat :
+			 V4L2_PIX_FMT_YUYV;
 
 	/* Only NV12 supported */
 	fmt->fmt.pix.pixelformat = pixfmt;
@@ -1399,9 +1405,8 @@ static int mixer_vidioc_try_fmt(struct file *file, void *fh,
 
 	fmt->fmt.pix.bytesperline =
 		mixer_bytesperline(fmt->fmt.pix.width, pixfmt);
-	fmt->fmt.pix.sizeimage =
-		mixer_image_size(fmt->fmt.pix.width, fmt->fmt.pix.height,
-				 pixfmt);
+	fmt->fmt.pix.sizeimage = mixer_image_size(fmt->fmt.pix.width,
+						  fmt->fmt.pix.height, pixfmt);
 	return 0;
 }
 
@@ -1682,7 +1687,7 @@ static int mixer_add(void)
 
 	mixer->out_width = MIXER_DEFAULT_OUT_WIDTH;
 	mixer->out_height = MIXER_DEFAULT_OUT_HEIGHT;
-    mixer->out_pixfmt = V4L2_PIX_FMT_YUYV;
+	mixer->out_pixfmt = V4L2_PIX_FMT_YUYV;
 	mixer->src_width = MIXER_DEFAULT_OUT_WIDTH;
 	mixer->src_height = MIXER_DEFAULT_OUT_HEIGHT / 2;
 	mixer->fps_num = MIXER_DEFAULT_FPS_NUM;

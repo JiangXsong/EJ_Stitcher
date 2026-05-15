@@ -95,6 +95,7 @@ struct proxy_mixer {
 	/* Output format — updated by s_fmt / s_parm */
 	u32 out_width;
 	u32 out_height;
+    u32 out_pixfmt;
 	/* per-source format (src_height = out_height / 2) */
 	u32 src_width;
 	u32 src_height;
@@ -110,6 +111,38 @@ struct proxy_mixer {
 	struct task_struct *mixer_task;
 	atomic_t streaming;
 };
+
+/* ------------------------------------------------------------------ */
+/* Pixel-format helpers */
+
+/*
+ * mixer_image_size - return total bytes for one frame at given w/h/pixfmt.
+ *   YUYV : w * h * 2
+ *   NV12 : w * h * 3 / 2
+ */
+static inline unsigned int mixer_image_size(u32 w, u32 h, u32 pixfmt)
+{
+	if (pixfmt == V4L2_PIX_FMT_NV12)
+		return w * h * 3 / 2;
+	return w * h * 2; /* YUYV default */
+}
+
+/*
+ * mixer_bytesperline - return bytes-per-line for the given format.
+ *   YUYV : w * 2   (packed, single plane)
+ *   NV12 : w       (Y stride; UV stride is the same for interleaved UV)
+ */
+static inline unsigned int mixer_bytesperline(u32 w, u32 pixfmt)
+{
+	if (pixfmt == V4L2_PIX_FMT_NV12)
+		return w;
+	return w * 2; /* YUYV */
+}
+
+static inline bool mixer_pixfmt_valid(u32 pixfmt)
+{
+	return pixfmt == V4L2_PIX_FMT_YUYV || pixfmt == V4L2_PIX_FMT_NV12;
+}
 
 /* ------------------------------------------------------------------ */
 /* Forward declarations */
@@ -128,8 +161,8 @@ static void mixer_queue_release(struct mixer_video_queue *q);
  * Once sources are ready these are replaced by values derived from the
  * source camera's actual capabilities.
  */
-#define MIXER_DEFAULT_OUT_WIDTH 1280
-#define MIXER_DEFAULT_OUT_HEIGHT 1440 /* 720 × 2 */
+#define MIXER_DEFAULT_OUT_WIDTH 3840
+#define MIXER_DEFAULT_OUT_HEIGHT 2160
 #define MIXER_DEFAULT_FPS_NUM 1
 #define MIXER_DEFAULT_FPS_DEN 30
 
@@ -492,7 +525,7 @@ static int mixer_uvc_negotiate_src_fmt(struct proxy_mixer *mixer, int slot)
 	src->fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
 	src->fmt.fmt.pix.width = mixer->src_width;
 	src->fmt.fmt.pix.height = mixer->src_height;
-	src->fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_YUYV;
+	src->fmt.fmt.pix.pixelformat = mixer->out_pixfmt;
 	src->fmt.fmt.pix.field = V4L2_FIELD_NONE;
 
 	ret = MIXER_CALL_OP(src, vidioc_s_fmt_vid_cap, src->filp, src->fh,
@@ -855,16 +888,14 @@ static int mixer_sync_frames(struct proxy_mixer *mixer)
 // 	memcpy(dst_uv_part1, src1_uv, size_uv);
 // }
 
-static void mixer_stitch_half_raw(u8 *dst, const u8 *src0, const u8 *src1, u32 w, u32 h)
+static void mixer_stitch_half_raw(u8 *dst, const u8 *src0, const u8 *src1, u64 raw_size)
 {
     /* Directory stitch two raw datas, assuming NV12 format current. */
-    u64 size_half = (u64)w * h * 2;
-
     u8 *dst_frame_top = dst;
-    u8 *dst_frame_bottom = dst + size_half;
+    u8 *dst_frame_bottom = dst + raw_size;
 
-    memcpy(dst_frame_top, src0, size_half);
-    memcpy(dst_frame_bottom, src1, size_half);
+    memcpy(dst_frame_top, src0, raw_size);
+    memcpy(dst_frame_bottom, src1, raw_size);
 }
 
 static int mixer_thread_fn(void *data)
@@ -873,9 +904,15 @@ static int mixer_thread_fn(void *data)
 	struct mixer_buffer *mbuf;
 	struct vb2_buffer *out_vb;
 	unsigned long flags;
+    u64 src_data_size;
+    u32 pixfmt;
 	int ret;
 
 	sched_set_fifo(current);
+
+    mutex_lock(&mixer->lock);
+	pixfmt = mixer->out_pixfmt;
+	mutex_unlock(&mixer->lock);
 
 	while (!kthread_should_stop()) {
 		ret = wait_event_interruptible(
@@ -959,7 +996,7 @@ static int mixer_thread_fn(void *data)
 
 		// /* Sync Frame */
 		ret = mixer_sync_frames(mixer);
-		if(ret) {
+		if (ret) {
 		        mixer_qbuf_src(mixer, 0);
 		        mixer_qbuf_src(mixer, 1);
 		        vb2_buffer_done(out_vb, VB2_BUF_STATE_ERROR);
@@ -984,17 +1021,19 @@ static int mixer_thread_fn(void *data)
 					dst, src0, src1);
 				continue;
 			}
-
+            
+            src_data_size = (u64)mixer_image_size(mixer->src_width, mixer->src_height, pixfmt);
+            
 			/* Stitch frames and copy to output buffer */
 			// mixer_stitch_nv12(dst, src0, src1, mixer->src_width,
 			// 		  mixer->src_height);
 
-            mixer_stitch_half_raw(dst, src0, src1, mixer->src_width, mixer->src_height);
+            mixer_stitch_half_raw(dst, src0, src1, src_data_size);
 		}
 
 		vb2_set_plane_payload(out_vb, 0,
-				      (size_t)mixer->out_width *
-					      mixer->out_height * 2);
+				              mixer_image_size(mixer->out_width, mixer->out_height,
+					          pixfmt));
 		out_vb->timestamp = ktime_get_ns();
 		vb2_buffer_done(out_vb, VB2_BUF_STATE_DONE);
 
@@ -1039,8 +1078,12 @@ static int mixer_queue_setup(struct vb2_queue *vbq, unsigned int *num_buffers,
 {
 	struct mixer_video_queue *q = vb2_get_drv_priv(vbq);
 	struct proxy_mixer *mixer = container_of(q, struct proxy_mixer, out_q);
-	unsigned int size =
-		mixer->out_width * mixer->out_height * 2; /* NV12 */
+	unsigned int size;
+
+    mutex_lock(&mixer->lock);
+	size = mixer_image_size(mixer->out_width, mixer->out_height,
+				mixer->out_pixfmt);
+	mutex_unlock(&mixer->lock);
 
 	pr_debug("proxy_mixer: queue_setup (nplanes=%d, nbuffers=%d)\n",
 		 *num_planes, *num_buffers);
@@ -1059,8 +1102,12 @@ static int mixer_buf_prepare(struct vb2_buffer *vb)
 {
 	struct mixer_video_queue *q = vb2_get_drv_priv(vb->vb2_queue);
 	struct proxy_mixer *mixer = container_of(q, struct proxy_mixer, out_q);
-	unsigned int size =
-		mixer->out_width * mixer->out_height * 2; /* NV12 */
+	unsigned int size;
+
+    mutex_lock(&mixer->lock);
+	size = mixer_image_size(mixer->out_width, mixer->out_height,
+				mixer->out_pixfmt);
+	mutex_unlock(&mixer->lock);
 
 	pr_debug("proxy_mixer: buf_prepare idx=%d, size requirement=%u\n",
 		 vb->index, size);
@@ -1184,9 +1231,8 @@ static int init_queue(struct mixer_video_queue *q)
 	q->vbq.timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC;
 
 	ret = vb2_queue_init(&q->vbq);
-	if (ret) {
+	if (ret)
 		return ret;
-	}
 
 	return 0;
 }
@@ -1244,13 +1290,21 @@ static int mixer_vidioc_querycap(struct file *file, void *fh,
 	return 0;
 }
 
+static const u32 mixer_formats[] = {
+	V4L2_PIX_FMT_YUYV,
+	V4L2_PIX_FMT_NV12,
+};
+#define MIXER_NUM_FORMATS ARRAY_SIZE(mixer_formats)
+
 static int mixer_vidioc_enum_fmt(struct file *file, void *fh,
 				 struct v4l2_fmtdesc *fmtdesc)
 {
-	if (fmtdesc->index != 0 || fmtdesc->type != V4L2_BUF_TYPE_VIDEO_CAPTURE)
+	if (fmtdesc->type != V4L2_BUF_TYPE_VIDEO_CAPTURE)
+		return -EINVAL;
+	if (fmtdesc->index >= MIXER_NUM_FORMATS)
 		return -EINVAL;
 
-	fmtdesc->pixelformat = V4L2_PIX_FMT_YUYV;
+	fmtdesc->pixelformat = mixer_formats[fmtdesc->index];
 	return 0;
 }
 
@@ -1259,10 +1313,13 @@ static void fill_fmt(struct proxy_mixer *mixer, struct v4l2_format *f)
 	mutex_lock(&mixer->lock);
 	f->fmt.pix.width = mixer->out_width;
 	f->fmt.pix.height = mixer->out_height;
-	f->fmt.pix.pixelformat = V4L2_PIX_FMT_YUYV;
+	f->fmt.pix.pixelformat = mixer->out_pixfmt;
 	f->fmt.pix.field = V4L2_FIELD_NONE;
-	f->fmt.pix.bytesperline = mixer->out_width;
-	f->fmt.pix.sizeimage = mixer->out_width * mixer->out_height * 2;
+	f->fmt.pix.bytesperline =
+		mixer_bytesperline(mixer->out_width, mixer->out_pixfmt);
+	f->fmt.pix.sizeimage =
+		mixer_image_size(mixer->out_width, mixer->out_height,
+				 mixer->out_pixfmt);
 	f->fmt.pix.colorspace = V4L2_COLORSPACE_SRGB;
 	mutex_unlock(&mixer->lock);
 }
@@ -1286,23 +1343,24 @@ static int mixer_vidioc_s_fmt(struct file *file, void *fh,
 
 	if (fmt->type != V4L2_BUF_TYPE_VIDEO_CAPTURE)
 		return -EINVAL;
-	if (fmt->fmt.pix.pixelformat != V4L2_PIX_FMT_YUYV)
-		return -EINVAL;
 
 	/*
-         * Accept the userspace-requested resolution.
-         * out_height must be even (top-bottom stitch of two equal halves).
-         */
+	 * Accept YUYV or NV12.  Anything else falls back to YUYV.
+	 */
 	mutex_lock(&mixer->lock);
+	if (mixer_pixfmt_valid(fmt->fmt.pix.pixelformat))
+		mixer->out_pixfmt = fmt->fmt.pix.pixelformat;
+	else
+		mixer->out_pixfmt = V4L2_PIX_FMT_YUYV;
+
 	if (fmt->fmt.pix.width > 0 && fmt->fmt.pix.height >= 2) {
 		mixer->out_width = fmt->fmt.pix.width;
-		mixer->out_height = fmt->fmt.pix.height &
-				    ~1u; /* round down to even */
+		mixer->out_height = fmt->fmt.pix.height & ~1u; /* round down to even */
 		mixer->src_width = mixer->out_width;
 		mixer->src_height = mixer->out_height / 2;
-		pr_info("proxy_mixer: s_fmt accepted %ux%u (src %ux%u)\n",
-			mixer->out_width, mixer->out_height, mixer->src_width,
-			mixer->src_height);
+		pr_info("proxy_mixer: s_fmt accepted %ux%u fmt=0x%X (src %ux%u)\n",
+			mixer->out_width, mixer->out_height, mixer->out_pixfmt,
+			mixer->src_width, mixer->src_height);
 	}
 	mutex_unlock(&mixer->lock);
 
@@ -1315,12 +1373,17 @@ static int mixer_vidioc_try_fmt(struct file *file, void *fh,
 				struct v4l2_format *fmt)
 {
 	struct proxy_mixer *mixer = video_drvdata(file);
+    u32 pixfmt;
 
 	if (fmt->type != V4L2_BUF_TYPE_VIDEO_CAPTURE)
 		return -EINVAL;
 
+    pixfmt = mixer_pixfmt_valid(fmt->fmt.pix.pixelformat)
+			 ? fmt->fmt.pix.pixelformat
+			 : V4L2_PIX_FMT_YUYV;
+
 	/* Only NV12 supported */
-	fmt->fmt.pix.pixelformat = V4L2_PIX_FMT_YUYV;
+	fmt->fmt.pix.pixelformat = pixfmt;
 	fmt->fmt.pix.field = V4L2_FIELD_NONE;
 	fmt->fmt.pix.colorspace = V4L2_COLORSPACE_SRGB;
 
@@ -1334,9 +1397,11 @@ static int mixer_vidioc_try_fmt(struct file *file, void *fh,
 		fmt->fmt.pix.height &= ~1u; /* round down to even */
 	}
 
-	fmt->fmt.pix.bytesperline = fmt->fmt.pix.width;
+	fmt->fmt.pix.bytesperline =
+		mixer_bytesperline(fmt->fmt.pix.width, pixfmt);
 	fmt->fmt.pix.sizeimage =
-		fmt->fmt.pix.width * fmt->fmt.pix.height * 2;
+		mixer_image_size(fmt->fmt.pix.width, fmt->fmt.pix.height,
+				 pixfmt);
 	return 0;
 }
 
@@ -1423,8 +1488,7 @@ static int mixer_vidioc_enum_framesizes(struct file *file, void *fh,
 	struct mixer_slot *src;
 	int ret;
 
-	/* Only NV12 */
-	if (fsize->pixel_format != V4L2_PIX_FMT_YUYV)
+	if (!mixer_pixfmt_valid(fsize->pixel_format))
 		return -EINVAL;
 
 	mutex_lock(&mixer->src_disc_lock);
@@ -1476,7 +1540,7 @@ static int mixer_vidioc_enum_frameintervals(struct file *file, void *fh,
 	struct mixer_slot *src;
 	int ret;
 
-	if (fival->pixel_format != V4L2_PIX_FMT_YUYV)
+	if (!mixer_pixfmt_valid(fival->pixel_format))
 		return -EINVAL;
 
 	mutex_lock(&mixer->src_disc_lock);
@@ -1488,9 +1552,9 @@ static int mixer_vidioc_enum_frameintervals(struct file *file, void *fh,
 	src = &mixer->src[0];
 
 	/*
-         * OBS passes the mixer's output height (doubled).
-         * Halve it to match the source camera's native resolution.
-         */
+     * OBS passes the mixer's output height (doubled).
+     * Halve it to match the source camera's native resolution.
+     */
 	fival->height /= 2;
 
 	ret = MIXER_CALL_OP(src, vidioc_enum_frameintervals, src->filp, src->fh,
@@ -1559,15 +1623,15 @@ static void init_vdev(struct proxy_mixer *mixer)
 	vdev->vfl_dir = VFL_DIR_RX;
 
 	/*
-         * Use the output queue mutex as the vdev lock.  This serializes
-         * all ioctls and — critically — allows STREAMOFF to preempt a
-         * blocking DQBUF: vb2's wait_prepare releases this lock while
-         * sleeping, so STREAMOFF can acquire it and cancel the queue.
-         *
-         * Without this, ffplay's SDL event loop cannot interrupt a
-         * blocking DQBUF to process the 'q' key, because close() →
-         * vb2_fop_release needs vdev->lock to proceed.
-         */
+     * Use the output queue mutex as the vdev lock.  This serializes
+     * all ioctls and — critically — allows STREAMOFF to preempt a
+     * blocking DQBUF: vb2's wait_prepare releases this lock while
+     * sleeping, so STREAMOFF can acquire it and cancel the queue.
+     *
+     * Without this, ffplay's SDL event loop cannot interrupt a
+     * blocking DQBUF to process the 'q' key, because close() →
+     * vb2_fop_release needs vdev->lock to proceed.
+     */
 	vdev->lock = &mixer->out_q.mutex;
 
 	vdev->queue = &mixer->out_q.vbq;
@@ -1618,6 +1682,7 @@ static int mixer_add(void)
 
 	mixer->out_width = MIXER_DEFAULT_OUT_WIDTH;
 	mixer->out_height = MIXER_DEFAULT_OUT_HEIGHT;
+    mixer->out_pixfmt = V4L2_PIX_FMT_YUYV;
 	mixer->src_width = MIXER_DEFAULT_OUT_WIDTH;
 	mixer->src_height = MIXER_DEFAULT_OUT_HEIGHT / 2;
 	mixer->fps_num = MIXER_DEFAULT_FPS_NUM;
@@ -1648,7 +1713,7 @@ static int mixer_add(void)
 	pr_info("proxy_mixer: output queue initialized\n");
 
 	mixer->vdev = video_device_alloc();
-	if (mixer->vdev == NULL) {
+	if (!mixer->vdev) {
 		pr_err("proxy_mixer: failed to allocate video device\n");
 		goto err_queue;
 	}

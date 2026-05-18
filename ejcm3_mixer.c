@@ -7,6 +7,9 @@
 #include <linux/videodev2.h>
 #include <linux/usb.h>
 #include <linux/workqueue.h>
+#include <linux/mm.h>
+#include <linux/highmem.h>
+#include <linux/vmalloc.h>
 
 #include <media/v4l2-dev.h>
 #include <media/v4l2-device.h>
@@ -15,14 +18,29 @@
 #include <media/videobuf2-v4l2.h>
 #include <media/videobuf2-vmalloc.h>
 
-#define MIXER_NUM_SOURCES 2
+#define MIXER_NUM_SOURCES  2
+#define MIXER_SRC_NUM_BUFS 4
 #define MIXER_OUT_NUM_BUFS 4 /* output queue buffer */
 #define MIXER_SYNC_TOLERANCE_US 16667ULL /* half frame @ 30fps */
 #define MIXER_SYNC_MAX_DROP 8
 
-#define MIXER_DEFAULT_VID 0x1E4E
+#define MIXER_DEFAULT_VID   0x1E4E
 #define MIXER_DEFAULT_PID_P 0x7301
 #define MIXER_DEFAULT_PID_S 0x7302
+
+#define MIXER_DEFAULT_OUT_WIDTH  3840
+#define MIXER_DEFAULT_OUT_HEIGHT 2160
+#define MIXER_DEFAULT_FPS_NUM    1
+#define MIXER_DEFAULT_FPS_DEN    60
+
+#define MIXER_ZC_MAX_OUT_BUFS (MIXER_SRC_NUM_BUFS - 1)
+
+/* ================================================================== */
+/* Module parameters                                                  */
+/* ================================================================== */
+static bool zerocopy = true;
+module_param(zerocopy, bool, 0444);
+MODULE_PARM_DESC(zerocopy, "Enable zero-copy page remap (default: true)");
 
 /*
  * MIXER_CALL_OP - call a UVC ioctl op directly, holding the vdev lock.
@@ -61,16 +79,65 @@ struct mixer_slot {
 	struct usb_device *udev;
 };
 
-struct mixer_disc_work {
-	struct work_struct work;
-	struct proxy_mixer *mixer;
-	struct video_device *vdev;
-	bool is_add;
+struct mixer_zc_held_src {
+	int slot;
+	unsigned int buf_index;
+	bool valid;
+};
+
+struct mixer_zc_buf {
+	unsigned int size;
+	unsigned int num_pages;
+
+	/*
+	 * Page array — updated each frame to point to source pages
+	 * (get_page'd) or boundary/initial pages (owned).
+	 * Reverted to initial_pages on release.
+	 */
+	struct page **pages;
+
+	/*
+	 * Owned backing pages — allocated once in zc_alloc.
+	 * Used as fallback (zeroed) content and as memcpy targets
+	 * for Phase 3 when half_size is not page-aligned.
+	 */
+	struct page **initial_pages;
+
+	/* Pre-allocated boundary page for non-page-aligned splits */
+	struct page *boundary_page;
+	void *boundary_kaddr;
+
+	/* Source page references (get_page'd) */
+	struct page **held_pages;
+	unsigned int held_count;
+	unsigned int held_capacity;
+
+	/* Deferred source QBUF tracking */
+	struct mixer_zc_held_src held_src[MIXER_NUM_SOURCES];
+
+	/* Cached kernel vmap (invalidated on page array change) */
+	void *vaddr;
+
+	/* For unmap_mapping_range (PTE invalidation) */
+	loff_t mmap_offset;
+	unsigned long mmap_size;
+	bool mmap_active;
+
+	/* Simple refcount for vb2 */
+	unsigned int refcount;
 };
 
 struct mixer_buffer {
 	struct vb2_v4l2_buffer buf;
 	struct list_head queue;
+    struct mixer_zc_buf *zbuf;
+};
+
+struct mixer_disc_work {
+	struct work_struct work;
+	struct proxy_mixer *mixer;
+	struct video_device *vdev;
+	bool is_add;
 };
 
 struct mixer_video_queue {
@@ -94,14 +161,11 @@ struct proxy_mixer {
 	struct workqueue_struct *disc_wq;
 	struct mixer_slot src[MIXER_NUM_SOURCES];
 
-	/* Output format — updated by s_fmt / s_parm */
 	u32 out_width;
 	u32 out_height;
 	u32 out_pixfmt;
-	/* per-source format (src_height = out_height / 2) */
 	u32 src_width;
 	u32 src_height;
-	/* framerate: numerator/denominator (timeperframe) */
 	u32 fps_num;
 	u32 fps_den;
 
@@ -112,7 +176,27 @@ struct proxy_mixer {
 
 	struct task_struct *mixer_task;
 	atomic_t streaming;
+
+	/* For unmap_mapping_range (zero-copy PTE invalidation) */
+	struct address_space *mapping;
 };
+
+/* ------------------------------------------------------------------ */
+/* Forward declarations */
+static int mixer_uvc_start(struct proxy_mixer *mixer);
+static void mixer_uvc_stop(struct proxy_mixer *mixer);
+static int mixer_register_class_intf(struct proxy_mixer *mixer,
+				     const struct class *vcls);
+static void mixer_unregister_class_intf(struct proxy_mixer *mixer);
+static void mixer_unregister(struct proxy_mixer *mixer);
+static int init_queue(struct mixer_video_queue *q);
+static void mixer_queue_release(struct mixer_video_queue *q);
+
+static struct proxy_mixer *g_mixer;
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("Syu-Song Chiang");
+MODULE_DESCRIPTION("V4L2 Proxy-Mixer: combine two UVC sources in kernel space");
 
 /* ------------------------------------------------------------------ */
 /* Pixel-format helpers */
@@ -145,34 +229,426 @@ static inline bool mixer_pixfmt_valid(u32 pixfmt)
 {
 	return pixfmt == V4L2_PIX_FMT_YUYV || pixfmt == V4L2_PIX_FMT_NV12;
 }
+/* ------------------------------------------------------------------ */
 
 /* ------------------------------------------------------------------ */
-/* Forward declarations */
-static int mixer_uvc_start(struct proxy_mixer *mixer);
-static void mixer_uvc_stop(struct proxy_mixer *mixer);
-static int mixer_register_class_intf(struct proxy_mixer *mixer,
-				     const struct class *vcls);
-static void mixer_unregister_class_intf(struct proxy_mixer *mixer);
-static void mixer_unregister(struct proxy_mixer *mixer);
-static int init_queue(struct mixer_video_queue *q);
-static void mixer_queue_release(struct mixer_video_queue *q);
 
-/* ------------------------------------------------------------------ */
+static void mixer_zc_return_sources(struct mixer_zc_buf *zbuf,
+				    struct proxy_mixer *mixer);
+
+/* ── vm_ops for fault-based userspace mapping ── */
+
+static vm_fault_t mixer_zc_vm_fault(struct vm_fault *vmf)
+{
+	struct mixer_zc_buf *zbuf = vmf->vma->vm_private_data;
+	unsigned long pgoff = vmf->pgoff;
+	struct page *page;
+
+	if (!zbuf || pgoff >= zbuf->num_pages)
+		return VM_FAULT_SIGBUS;
+
+	page = zbuf->pages[pgoff];
+	if (!page)
+		return VM_FAULT_SIGBUS;
+
+	get_page(page);
+	vmf->page = page;
+	return 0;
+}
+
+static const struct vm_operations_struct mixer_zc_vm_ops = {
+	.fault = mixer_zc_vm_fault,
+};
+
+/* ── mem_ops callbacks ── */
+
+static void *mixer_zc_alloc(struct vb2_buffer *vb, struct device *dev,
+			    unsigned long size)
+{
+	struct mixer_zc_buf *zbuf;
+	unsigned int npages = PAGE_ALIGN(size) >> PAGE_SHIFT;
+	unsigned int i;
+
+	zbuf = kzalloc(sizeof(*zbuf), GFP_KERNEL);
+	if (!zbuf)
+		return ERR_PTR(-ENOMEM);
+
+	zbuf->size = size;
+	zbuf->num_pages = npages;
+	zbuf->refcount = 1;
+
+	zbuf->pages = kcalloc(npages, sizeof(struct page *), GFP_KERNEL);
+	zbuf->initial_pages = kcalloc(npages, sizeof(struct page *), GFP_KERNEL);
+	zbuf->held_pages = kcalloc(npages * 2, sizeof(struct page *), GFP_KERNEL);
+	if (!zbuf->pages || !zbuf->initial_pages || !zbuf->held_pages)
+		goto err_arrays;
+
+	zbuf->held_capacity = npages * 2;
+
+	/* Allocate owned backing pages (zeroed) */
+	for (i = 0; i < npages; i++) {
+		zbuf->initial_pages[i] = alloc_page(GFP_KERNEL | __GFP_ZERO);
+		if (!zbuf->initial_pages[i])
+			goto err_pages;
+		zbuf->pages[i] = zbuf->initial_pages[i];
+	}
+
+	/* Boundary page for non-page-aligned splits */
+	zbuf->boundary_page = alloc_page(GFP_KERNEL | __GFP_ZERO);
+	if (!zbuf->boundary_page)
+		goto err_pages;
+	zbuf->boundary_kaddr = page_address(zbuf->boundary_page);
+
+	/* Initialize deferred source tracking */
+	for (i = 0; i < MIXER_NUM_SOURCES; i++)
+		zbuf->held_src[i].valid = false;
+
+	pr_debug("proxy_mixer: zc_alloc size=%lu pages=%u\n", size, npages);
+	return zbuf;
+
+err_pages:
+	for (i = 0; i < npages; i++) {
+		if (zbuf->initial_pages[i])
+			__free_page(zbuf->initial_pages[i]);
+	}
+err_arrays:
+	kfree(zbuf->held_pages);
+	kfree(zbuf->initial_pages);
+	kfree(zbuf->pages);
+	kfree(zbuf);
+	return ERR_PTR(-ENOMEM);
+}
+
+static void mixer_zc_put(void *buf_priv)
+{
+	struct mixer_zc_buf *zbuf = buf_priv;
+	unsigned int i;
+
+	if (!zbuf)
+		return;
+
+	if (--zbuf->refcount > 0)
+		return;
+
+	/* Release any held source pages */
+	for (i = 0; i < zbuf->held_count; i++) {
+		if (zbuf->held_pages[i])
+			put_page(zbuf->held_pages[i]);
+	}
+
+	/* Tear down kernel vmap */
+	if (zbuf->vaddr) {
+		vunmap(zbuf->vaddr);
+		zbuf->vaddr = NULL;
+	}
+
+	/* Free owned backing pages */
+	for (i = 0; i < zbuf->num_pages; i++) {
+		if (zbuf->initial_pages[i])
+			__free_page(zbuf->initial_pages[i]);
+	}
+
+	if (zbuf->boundary_page)
+		__free_page(zbuf->boundary_page);
+
+	kfree(zbuf->held_pages);
+	kfree(zbuf->initial_pages);
+	kfree(zbuf->pages);
+	kfree(zbuf);
+}
+
+static void *mixer_zc_vaddr(struct vb2_buffer *vb, void *buf_priv)
+{
+	/*
+	 * No contiguous kernel VA for the output buffer in zero-copy mode.
+	 * kthread accesses boundary page directly via zbuf->boundary_kaddr.
+	 * Return NULL — callers must not use vb2_plane_vaddr on output.
+	 */
+	return NULL;
+}
+
+static unsigned int mixer_zc_num_users(void *buf_priv)
+{
+	struct mixer_zc_buf *zbuf = buf_priv;
+
+	return zbuf ? zbuf->refcount : 0;
+}
+
+static int mixer_zc_mmap(void *buf_priv, struct vm_area_struct *vma)
+{
+	struct mixer_zc_buf *zbuf = buf_priv;
+
+	if (!zbuf)
+		return -EINVAL;
+
+	/* Record for unmap_mapping_range (PTE invalidation) */
+	zbuf->mmap_offset = (loff_t)vma->vm_pgoff << PAGE_SHIFT;
+	zbuf->mmap_size = vma->vm_end - vma->vm_start;
+	zbuf->mmap_active = true;
+
+	vm_flags_set(vma, VM_DONTEXPAND | VM_DONTDUMP);
+	vma->vm_ops = &mixer_zc_vm_ops;
+	vma->vm_private_data = zbuf;
+
+	pr_debug("proxy_mixer: zc_mmap offset=%lld size=%lu\n",
+		 zbuf->mmap_offset, zbuf->mmap_size);
+	return 0;
+}
+
+static const struct vb2_mem_ops mixer_zc_memops = {
+	.alloc = mixer_zc_alloc,
+	.put = mixer_zc_put,
+	.vaddr = mixer_zc_vaddr,
+	.mmap = mixer_zc_mmap,
+	.num_users = mixer_zc_num_users,
+};
+
 /**
- * Fallback output dimensions used before any UVC source is discovered.
- * Once sources are ready these are replaced by values derived from the
- * source camera's actual capabilities.
+ * mixer_qbuf_src_by_index - QBUF a source buffer by vb2 index.
+ *
+ * Used for deferred QBUF: the kthread stores the index, and the actual
+ * QBUF ioctl happens later (in buf_prepare or stop_streaming).
  */
-#define MIXER_DEFAULT_OUT_WIDTH 3840
-#define MIXER_DEFAULT_OUT_HEIGHT 2160
-#define MIXER_DEFAULT_FPS_NUM 1
-#define MIXER_DEFAULT_FPS_DEN 60
+static void mixer_qbuf_src_by_index(struct proxy_mixer *mixer, int slot,
+				    unsigned int buf_index)
+{
+	struct mixer_slot *src = &mixer->src[slot];
+	struct v4l2_buffer buf = {
+		.index = buf_index,
+		.type = V4L2_BUF_TYPE_VIDEO_CAPTURE,
+		.memory = V4L2_MEMORY_MMAP,
+	};
 
-static struct proxy_mixer *g_mixer;
+	if (IS_ERR_OR_NULL(src->filp) || !src->vdev)
+		return;
 
-MODULE_LICENSE("GPL");
-MODULE_AUTHOR("Syu-Song Chiang");
-MODULE_DESCRIPTION("V4L2 Proxy-Mixer: combine two UVC sources in kernel space");
+	MIXER_CALL_OP(src, vidioc_qbuf, src->filp, src->fh, &buf);
+}
+
+static void mixer_zc_return_sources(struct mixer_zc_buf *zbuf,
+				    struct proxy_mixer *mixer)
+{
+	int i;
+
+	for (i = 0; i < MIXER_NUM_SOURCES; i++) {
+		if (!zbuf->held_src[i].valid)
+			continue;
+		mixer_qbuf_src_by_index(mixer, zbuf->held_src[i].slot,
+					zbuf->held_src[i].buf_index);
+		zbuf->held_src[i].valid = false;
+	}
+}
+
+/**
+ * mixer_zc_invalidate_vmap - drop cached kernel vmap.
+ * Must be called BEFORE changing zbuf->pages[].
+ */
+static void mixer_zc_invalidate_vmap(struct mixer_zc_buf *zbuf)
+{
+	if (zbuf->vaddr) {
+		vunmap(zbuf->vaddr);
+		zbuf->vaddr = NULL;
+	}
+}
+
+/**
+ * mixer_zc_zap_userspace - invalidate userspace PTEs for this buffer.
+ *
+ * Uses unmap_mapping_range on the video device's inode address_space.
+ * Works across all processes that have mmap'd this buffer.
+ * Safe from any context that doesn't hold mmap_lock.
+ */
+static void mixer_zc_zap_userspace(struct proxy_mixer *mixer,
+				   struct mixer_zc_buf *zbuf)
+{
+	if (mixer->mapping && zbuf->mmap_active)
+		unmap_mapping_range(mixer->mapping,
+				    zbuf->mmap_offset,
+				    zbuf->mmap_size, 1);
+}
+
+/**
+ * mixer_zc_release_held_pages - release all held source pages and
+ * restore initial pages.  Called from buf_prepare (re-QBUF) and
+ * stop path.
+ */
+static void mixer_zc_release_held_pages(struct proxy_mixer *mixer,
+					struct mixer_zc_buf *zbuf)
+{
+	unsigned int i;
+
+	mixer_zc_invalidate_vmap(zbuf);
+	mixer_zc_zap_userspace(mixer, zbuf);
+
+	for (i = 0; i < zbuf->held_count; i++) {
+		if (zbuf->held_pages[i]) {
+			put_page(zbuf->held_pages[i]);
+			zbuf->held_pages[i] = NULL;
+		}
+	}
+	zbuf->held_count = 0;
+
+	for (i = 0; i < zbuf->num_pages; i++)
+		zbuf->pages[i] = zbuf->initial_pages[i];
+}
+
+/**
+ * mixer_zerocopy_stitch - universal zero-copy stitch with boundary page.
+ *
+ * Remaps output buffer pages to source buffer pages.
+ * At most one page (boundary) requires memcpy.
+ *
+ * @zbuf:      zero-copy buffer metadata
+ * @src0_va:   kernel VA of src0 data (from vb2_plane_vaddr on UVC buffer)
+ * @src1_va:   kernel VA of src1 data
+ * @half_size: bytes per source (= total frame size / 2)
+ */
+static int mixer_zerocopy_stitch(struct proxy_mixer *mixer,
+				 struct mixer_zc_buf *zbuf,
+				 const u8 *src0_va, const u8 *src1_va,
+				 u64 half_size, bool *src1_can_release)
+{
+	const unsigned int full_pages = half_size >> PAGE_SHIFT;
+	const unsigned int tail = half_size & (PAGE_SIZE - 1);
+	const unsigned int gap  = tail ? (PAGE_SIZE - tail) : 0;
+	unsigned int out_idx = 0;
+	unsigned int held_idx = 0;
+	unsigned int i;
+	struct page *pg;
+
+	*src1_can_release = false;
+
+	/* Release previously held pages (also invalidates vmap + PTEs) */
+	mixer_zc_release_held_pages(mixer, zbuf);
+
+	/* ── Phase 1: src0 full pages (remap) ── */
+	for (i = 0; i < full_pages; i++) {
+		pg = vmalloc_to_page(src0_va + (u64)i * PAGE_SIZE);
+		if (!pg)
+			goto err_release;
+		get_page(pg);
+		zbuf->held_pages[held_idx++] = pg;
+		zbuf->pages[out_idx++] = pg;
+	}
+
+	if (tail == 0) {
+		/*
+		 * ── Page-aligned fast path: remap src1 directly ──
+		 *
+		 * gap == 0, so src1 data starts at a page boundary in
+		 * the output.  vmalloc_to_page on page-aligned offsets
+		 * within src1 gives us the correct 1:1 mapping.
+		 */
+		unsigned int s1_pages = half_size >> PAGE_SHIFT;
+
+		for (i = 0; i < s1_pages; i++) {
+			pg = vmalloc_to_page(src1_va + (u64)i * PAGE_SIZE);
+			if (!pg)
+				goto err_release;
+			get_page(pg);
+			zbuf->held_pages[held_idx++] = pg;
+			zbuf->pages[out_idx++] = pg;
+		}
+		zbuf->held_count = held_idx;
+		/* Both sources held — deferred QBUF */
+		*src1_can_release = false;
+	} else {
+		/*
+		 * ── Non-aligned path: boundary + memcpy src1 ──
+		 *
+		 * After the boundary page, src1 data at offset `gap`
+		 * is NOT page-aligned within src1's vmalloc region.
+		 * Each output page would need data from TWO src1
+		 * physical pages — impossible with single-page remap.
+		 *
+		 * Solution: memcpy src1 into the output buffer's own
+		 * initial_pages.  Still zero-copy for src0 (~50%).
+		 */
+		const u8 *s1_ptr;
+		u64 s1_remaining;
+		void *dst;
+
+		/* Phase 2: boundary page */
+		memcpy(zbuf->boundary_kaddr,
+		       src0_va + (u64)full_pages * PAGE_SIZE, tail);
+		memcpy(zbuf->boundary_kaddr + tail, src1_va, gap);
+		zbuf->pages[out_idx++] = zbuf->boundary_page;
+
+		/* Phase 3: memcpy src1 remainder into owned pages */
+		s1_ptr = src1_va + gap;
+		s1_remaining = half_size - gap;
+
+		while (s1_remaining > 0) {
+			unsigned int chunk = min_t(u64, s1_remaining,
+						   PAGE_SIZE);
+
+			/*
+			 * Use initial_pages — these are allocated and
+			 * owned by the output buffer, safe to write.
+			 */
+			zbuf->pages[out_idx] = zbuf->initial_pages[out_idx];
+			dst = page_address(zbuf->pages[out_idx]);
+			memcpy(dst, s1_ptr, chunk);
+
+			s1_ptr += chunk;
+			s1_remaining -= chunk;
+			out_idx++;
+		}
+		zbuf->held_count = held_idx;
+
+		/*
+		 * src1 data is fully copied — source buffer can be
+		 * returned immediately, reducing UVC buffer pressure.
+		 */
+		*src1_can_release = true;
+	}
+
+	return 0;
+
+err_release:
+	for (i = 0; i < held_idx; i++) {
+		put_page(zbuf->held_pages[i]);
+		zbuf->held_pages[i] = NULL;
+	}
+	zbuf->held_count = 0;
+	/* Restore initial pages */
+	for (i = 0; i < zbuf->num_pages; i++)
+		zbuf->pages[i] = zbuf->initial_pages[i];
+	return -EFAULT;
+}
+
+/**
+ * mixer_release_all_held - release all zero-copy resources from every output buffer.
+ *
+ * Must be called BEFORE UVC streamoff so source buffers can be returned
+ * while the UVC queue is still active.
+ */
+static void mixer_release_all_held(struct proxy_mixer *mixer)
+{
+	struct vb2_queue *q = &mixer->out_q.vbq;
+	unsigned int i;
+
+	if (!zerocopy)
+		return;
+
+	for (i = 0; i < q->max_num_buffers; i++) {
+		struct vb2_buffer *vb = vb2_get_buffer(q, i);
+		struct mixer_zc_buf *zbuf;
+
+		if (!vb)
+			continue;
+		zbuf = vb->planes[0].mem_priv;
+		if (!zbuf)
+			continue;
+
+		/* Release held pages + restore initial pages */
+		if (zbuf->held_count > 0)
+			mixer_zc_release_held_pages(mixer, zbuf);
+
+		/* Return deferred source buffers to UVC */
+		mixer_zc_return_sources(zbuf, mixer);
+	}
+}
 
 /* ------------------------------------------------------------------ */
 /*
@@ -639,6 +1115,38 @@ static int mixer_uvc_streamon(struct proxy_mixer *mixer, int idx)
 	return ret;
 }
 
+/**
+ * mixer_uvc_streamoff_only - STREAMOFF without freeing buffers.
+ * Used in the stop path to unblock kthread's DQBUF before kthread_stop.
+ */
+static void mixer_uvc_streamoff_only(struct proxy_mixer *mixer, int idx)
+{
+	struct mixer_slot *src = &mixer->src[idx];
+	enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+
+	if (IS_ERR_OR_NULL(src->filp) || !src->vdev)
+		return;
+	MIXER_CALL_OP(src, vidioc_streamoff, src->filp, src->fh, type);
+}
+
+/**
+ * mixer_uvc_free_bufs - REQBUFS(0) to free UVC buffers.
+ * Must be called AFTER all held page references are released.
+ */
+static void mixer_uvc_free_bufs(struct proxy_mixer *mixer, int idx)
+{
+	struct mixer_slot *src = &mixer->src[idx];
+	struct v4l2_requestbuffers reqbufs = {
+		.count = 0,
+		.type = V4L2_BUF_TYPE_VIDEO_CAPTURE,
+		.memory = V4L2_MEMORY_MMAP,
+	};
+
+	if (IS_ERR_OR_NULL(src->filp) || !src->vdev)
+		return;
+	MIXER_CALL_OP(src, vidioc_reqbufs, src->filp, src->fh, &reqbufs);
+}
+
 static int mixer_uvc_streamoff(struct proxy_mixer *mixer, int idx)
 {
 	struct mixer_slot *src = &mixer->src[idx];
@@ -747,28 +1255,40 @@ static void mixer_uvc_stop(struct proxy_mixer *mixer)
 {
 	int i;
 
-	pr_info("proxy_mixer: stopping mixer...\n");
-	if (!atomic_cmpxchg(&mixer->streaming, 1, 0)) {
-		/* Not streaming */
-		pr_info("proxy_mixer: already stopped\n");
+	if (!atomic_cmpxchg(&mixer->streaming, 1, 0))
 		return;
-	}
 
+	pr_info("proxy_mixer: stopping pipeline\n");
+
+	/*
+	 * Phase 1: UVC STREAMOFF only — unblocks kthread's blocking DQBUF.
+	 * Does NOT free buffers (REQBUFS 0) yet.
+	 */
+	for (i = 0; i < MIXER_NUM_SOURCES; i++)
+		mixer_uvc_streamoff_only(mixer, i);
+
+	/* Phase 2: wake kthread and wait for exit */
 	wake_up_all(&mixer->out_q.buf_wq);
-
-	for (i = 0; i < MIXER_NUM_SOURCES; i++) {
-		mixer_uvc_streamoff(mixer, i);
-	}
-
-	wake_up_all(&mixer->out_q.buf_wq);
-
 	if (mixer->mixer_task) {
-		pr_info("proxy_mixer: stopping kthread...\n");
 		kthread_stop(mixer->mixer_task);
 		mixer->mixer_task = NULL;
-		pr_info("proxy_mixer: kthread stopped\n");
 	}
-	pr_info("proxy_mixer: mixer stopped\n");
+
+	/*
+	 * Phase 3: release all held source pages + return source buffers.
+	 * Must happen BEFORE REQBUFS(0) — UVC's vfree must not run
+	 * while we still hold get_page'd references to those pages.
+	 */
+	mixer_release_all_held(mixer);
+
+	/*
+	 * Phase 4: REQBUFS(0) to free UVC buffers.
+	 * Now safe — all our page references are released.
+	 */
+	for (i = 0; i < MIXER_NUM_SOURCES; i++)
+		mixer_uvc_free_bufs(mixer, i);
+
+	pr_info("proxy_mixer: pipeline stopped\n");
 }
 
 static int mixer_dqbuf_src(struct proxy_mixer *mixer, int slot)
@@ -836,7 +1356,7 @@ static void mixer_qbuf_src(struct proxy_mixer *mixer, int slot)
 	src->buf_ready = false;
 }
 
-static void mixer_stitch_half_raw(u8 *dst, const u8 *src0, const u8 *src1,
+static void mixer_stitch_memcpy(u8 *dst, const u8 *src0, const u8 *src1,
 				  u64 raw_size)
 {
 	u8 *dst_frame_top = dst;
@@ -852,17 +1372,23 @@ static int mixer_thread_fn(void *data)
 	struct mixer_buffer *mbuf;
 	struct vb2_buffer *out_vb;
 	unsigned long flags;
-	u64 src_data_size;
+	u64 half_size;
 	u32 pixfmt;
+    u32 out_size;
+    bool src1_can_release;
 	int ret;
 
 	sched_set_fifo(current);
 
 	mutex_lock(&mixer->lock);
 	pixfmt = mixer->out_pixfmt;
+    out_size = mixer_image_size(mixer->out_width, mixer->out_height, pixfmt);
 	mutex_unlock(&mixer->lock);
 
 	while (!kthread_should_stop()) {
+		void *src0_va, *src1_va;
+        half_size = (u64)out_size / 2;
+
 		ret = wait_event_interruptible(
 			mixer->out_q.buf_wq,
 			!list_empty(&mixer->out_q.irqqueue) ||
@@ -942,40 +1468,78 @@ static int mixer_thread_fn(void *data)
 			continue;
 		}
 
-		{
-			void *dst = vb2_plane_vaddr(out_vb, 0);
-			void *src0 = mixer->src[0].cur_vb ?
-					     vb2_plane_vaddr(
-						     mixer->src[0].cur_vb, 0) :
-					     NULL;
-			void *src1 = mixer->src[1].cur_vb ?
-					     vb2_plane_vaddr(
-						     mixer->src[1].cur_vb, 0) :
-					     NULL;
-			if (!dst || !src0 || !src1) {
+        src0_va = mixer->src[0].cur_vb ?
+                  vb2_plane_vaddr(mixer->src[0].cur_vb, 0) :
+                  NULL;
+        src1_va = mixer->src[1].cur_vb ?
+                  vb2_plane_vaddr(mixer->src[1].cur_vb, 0) :
+                  NULL;
+        if (!src0_va || !src1_va) {
+            mixer_qbuf_src(mixer, 0);
+            mixer_qbuf_src(mixer, 1);
+            pr_info("proxy_mixer: invalid buffer addresses (src0=%p, src1=%p), skipping frame\n",
+                src0_va, src1_va);
+            continue;
+        }
+
+        /* ── Stitch ── */
+		if (zerocopy && mbuf->zbuf) {
+			/*
+			 * Zero-copy path: remap source pages into output.
+			 * Source buffers are NOT returned here — they are
+			 * held until userspace re-QBUFs this output buffer
+			 * (released in buf_prepare).
+			 */
+			struct mixer_zc_buf *zbuf = mbuf->zbuf;
+
+			ret = mixer_zerocopy_stitch(mixer, zbuf,
+                                        src0_va, src1_va,
+                                        half_size,
+                                        &src1_can_release);
+			if (ret) {
 				mixer_qbuf_src(mixer, 0);
 				mixer_qbuf_src(mixer, 1);
-				pr_info("proxy_mixer: invalid buffer addresses (dst=%p, src0=%p, src1=%p), skipping frame\n",
-					dst, src0, src1);
+				vb2_buffer_done(out_vb, VB2_BUF_STATE_ERROR);
 				continue;
 			}
 
-			src_data_size = (u64)mixer_image_size(
-				mixer->src_width, mixer->src_height, pixfmt);
+			/* Deferred QBUF: always hold src0 (pages remapped) */
+            zbuf->held_src[0].slot  = 0;
+            zbuf->held_src[0].buf_index = mixer->src[0].cur_vb->index;
+            zbuf->held_src[0].valid = true;
+            mixer->src[0].cur_vb    = NULL;
+            mixer->src[0].buf_ready = false;
 
-			mixer_stitch_half_raw(dst, src0, src1, src_data_size);
-		}
+            if (src1_can_release) {
+                /* src1 fully copied — return immediately */
+                mixer_qbuf_src(mixer, 1);
+                zbuf->held_src[1].valid = false;
+            } else {
+                /* src1 pages remapped — must defer QBUF */
+                zbuf->held_src[1].slot  = 1;
+                zbuf->held_src[1].buf_index = mixer->src[1].cur_vb->index;
+                zbuf->held_src[1].valid = true;
+                mixer->src[1].cur_vb    = NULL;
+                mixer->src[1].buf_ready = false;
+            }
+		} else {
+            void *dst = vb2_plane_vaddr(out_vb, 0);
+            if (!dst) {
+				mixer_qbuf_src(mixer, 0);
+				mixer_qbuf_src(mixer, 1);
+				vb2_buffer_done(out_vb, VB2_BUF_STATE_ERROR);
+				continue;
+			}
 
-		vb2_set_plane_payload(out_vb, 0,
-				      mixer_image_size(mixer->out_width,
-						       mixer->out_height,
-						       pixfmt));
+            mixer_stitch_memcpy(dst, src0_va, src1_va, half_size);
+            /* QBUF back to sources */
+            mixer_qbuf_src(mixer, 0);
+            mixer_qbuf_src(mixer, 1);
+        }
+        
+		vb2_set_plane_payload(out_vb, 0, out_size);
 		out_vb->timestamp = ktime_get_ns();
-		vb2_buffer_done(out_vb, VB2_BUF_STATE_DONE);
-
-		/* QBUF back to sources */
-		mixer_qbuf_src(mixer, 0);
-		mixer_qbuf_src(mixer, 1);
+		vb2_buffer_done(out_vb, VB2_BUF_STATE_DONE);	
 	}
 	pr_info("proxy_mixer: kthread exiting\n");
 	return 0;
@@ -1028,9 +1592,34 @@ static int mixer_queue_setup(struct vb2_queue *vbq, unsigned int *num_buffers,
 
 	*num_planes = 1;
 	sizes[0] = size;
-	*num_buffers = max(*num_buffers, MIXER_OUT_NUM_BUFS);
-	pr_info("proxy_mixer: output queue setup: size=%u, buffers=%u\n", size,
-		*num_buffers);
+	*num_buffers = max_t(unsigned int, *num_buffers, 2);
+
+	/*
+	 * Zero-copy: limit output buffers to prevent source pool exhaustion.
+	 * Each output frame holds one buffer from each source (deferred QBUF).
+	 * With N source buffers, at most N-1 can be held simultaneously,
+	 * leaving at least 1 free in each source for the next DQBUF.
+	 */
+	if (zerocopy)
+		*num_buffers = min_t(unsigned int, *num_buffers,
+				     MIXER_ZC_MAX_OUT_BUFS);
+
+	pr_info("proxy_mixer: queue_setup size=%u buffers=%u zerocopy=%d\n",
+		size, *num_buffers, zerocopy);
+	return 0;
+}
+
+static int mixer_buf_init(struct vb2_buffer *vb)
+{
+	struct vb2_v4l2_buffer *vbuf = to_vb2_v4l2_buffer(vb);
+	struct mixer_buffer *mbuf =
+		container_of(vbuf, struct mixer_buffer, buf);
+
+	if (zerocopy)
+		mbuf->zbuf = vb->planes[0].mem_priv;
+	else
+		mbuf->zbuf = NULL;
+
 	return 0;
 }
 
@@ -1038,6 +1627,9 @@ static int mixer_buf_prepare(struct vb2_buffer *vb)
 {
 	struct mixer_video_queue *q = vb2_get_drv_priv(vb->vb2_queue);
 	struct proxy_mixer *mixer = container_of(q, struct proxy_mixer, out_q);
+    struct vb2_v4l2_buffer *vbuf = to_vb2_v4l2_buffer(vb);
+	struct mixer_buffer *mbuf =
+		container_of(vbuf, struct mixer_buffer, buf);
 	unsigned int size;
 
 	mutex_lock(&mixer->lock);
@@ -1045,18 +1637,38 @@ static int mixer_buf_prepare(struct vb2_buffer *vb)
 				mixer->out_pixfmt);
 	mutex_unlock(&mixer->lock);
 
-	pr_debug("proxy_mixer: buf_prepare idx=%d, size requirement=%u\n",
-		 vb->index, size);
-	if (vb->index >= q->vbq.max_num_buffers) {
-		pr_err("proxy_mixer: buffer index %d out of range\n",
-		       vb->index);
-		return -EINVAL;
-	}
+	// pr_debug("proxy_mixer: buf_prepare idx=%d, size requirement=%u\n",
+	// 	 vb->index, size);
+	// if (vb->index >= q->vbq.max_num_buffers) {
+	// 	pr_err("proxy_mixer: buffer index %d out of range\n",
+	// 	       vb->index);
+	// 	return -EINVAL;
+	// }
 	if (vb2_plane_size(vb, 0) < size) {
 		pr_err("proxy_mixer: buffer plane size < required %d\n", size);
 		return -EINVAL;
 	}
 
+    /*
+	 * Zero-copy cleanup: this buffer may have been used in a previous
+	 * frame. Release held source pages and return source buffers to UVC
+	 * before the buffer can be reused by the kthread.
+	 *
+	 * mixer_zc_release_held_pages handles:
+	 *   1. Invalidate kernel vmap
+	 *   2. Invalidate userspace PTEs (unmap_mapping_range)
+	 *   3. Release source pages (put_page)
+	 *   4. Restore initial_pages
+	 *
+	 * mixer_zc_return_sources handles:
+	 *   5. Return source buffers to UVC (deferred QBUF)
+	 */
+	if (mbuf->zbuf) {
+		if (mbuf->zbuf->held_count > 0)
+			mixer_zc_release_held_pages(mixer, mbuf->zbuf);
+		mixer_zc_return_sources(mbuf->zbuf, mixer);
+	}
+    
 	return 0;
 }
 
@@ -1126,15 +1738,37 @@ static void mixer_stop_streaming(struct vb2_queue *vbq)
 	pr_info("proxy_mixer: stop_streaming completed\n");
 }
 
+static void mixer_buf_cleanup(struct vb2_buffer *vb)
+{
+	struct mixer_video_queue *q = vb2_get_drv_priv(vb->vb2_queue);
+	struct proxy_mixer *mixer = container_of(q, struct proxy_mixer, out_q);
+	struct vb2_v4l2_buffer *vbuf = to_vb2_v4l2_buffer(vb);
+	struct mixer_buffer *mbuf =
+		container_of(vbuf, struct mixer_buffer, buf);
+
+	/*
+	 * Safety net: release any source pages still held.
+	 * Normally released in buf_prepare or stop_streaming.
+	 */
+	if (mbuf->zbuf) {
+		if (mbuf->zbuf->held_count > 0)
+			mixer_zc_release_held_pages(mixer, mbuf->zbuf);
+		/* Don't return sources here — UVC may already be torn down */
+		mbuf->zbuf = NULL;
+	}
+}
+
 const struct vb2_ops mixer_vb2_ops = {
 	// clang-format off
-        .queue_setup     = mixer_queue_setup,
-        .buf_prepare     = mixer_buf_prepare,
-        .buf_queue       = mixer_buf_queue,
-        .start_streaming = mixer_start_streaming,
-        .stop_streaming  = mixer_stop_streaming,
-        .wait_prepare    = vb2_ops_wait_prepare,
-        .wait_finish     = vb2_ops_wait_finish,
+    .queue_setup     = mixer_queue_setup,
+	.buf_init        = mixer_buf_init,
+	.buf_prepare     = mixer_buf_prepare,
+	.buf_queue       = mixer_buf_queue,
+	.buf_cleanup     = mixer_buf_cleanup,
+	.start_streaming = mixer_start_streaming,
+	.stop_streaming  = mixer_stop_streaming,
+	.wait_prepare    = vb2_ops_wait_prepare,
+	.wait_finish     = vb2_ops_wait_finish,
 	// clang-format on
 };
 
@@ -1153,13 +1787,23 @@ static int init_queue(struct mixer_video_queue *q)
 	INIT_LIST_HEAD(&q->irqqueue);
 
 	q->vbq.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-	q->vbq.io_modes = VB2_MMAP | VB2_DMABUF | VB2_READ;
+	// q->vbq.io_modes = VB2_MMAP | VB2_DMABUF | VB2_READ;
 	q->vbq.drv_priv = q;
 	q->vbq.ops = &mixer_vb2_ops;
-	q->vbq.mem_ops = &vb2_vmalloc_memops;
+	// q->vbq.mem_ops = &vb2_vmalloc_memops;
 	q->vbq.buf_struct_size = sizeof(struct mixer_buffer);
 	q->vbq.lock = &q->mutex;
 	q->vbq.timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC;
+
+    if (zerocopy) {
+		q->vbq.io_modes = VB2_MMAP;
+		q->vbq.mem_ops = &mixer_zc_memops;
+		pr_info("proxy_mixer: using zero-copy mem_ops\n");
+	} else {
+		q->vbq.io_modes = VB2_MMAP | VB2_DMABUF | VB2_READ;
+		q->vbq.mem_ops = &vb2_vmalloc_memops;
+		pr_info("proxy_mixer: using vmalloc mem_ops (fallback)\n");
+	}
 
 	ret = vb2_queue_init(&q->vbq);
 	if (ret)
@@ -1278,10 +1922,9 @@ static int mixer_vidioc_s_fmt(struct file *file, void *fh,
 	 * Accept YUYV or NV12.  Anything else falls back to YUYV.
 	 */
 	mutex_lock(&mixer->lock);
-	if (mixer_pixfmt_valid(fmt->fmt.pix.pixelformat))
-		mixer->out_pixfmt = fmt->fmt.pix.pixelformat;
-	else
-		mixer->out_pixfmt = V4L2_PIX_FMT_YUYV;
+	mixer->out_pixfmt = mixer_pixfmt_valid(fmt->fmt.pix.pixelformat) ?
+				    fmt->fmt.pix.pixelformat :
+				    V4L2_PIX_FMT_YUYV;
 
 	if (fmt->fmt.pix.width > 0 && fmt->fmt.pix.height >= 2) {
 		mixer->out_width = fmt->fmt.pix.width;
@@ -1427,10 +2070,6 @@ static int mixer_vidioc_enum_framesizes(struct file *file, void *fh,
 	}
 	src = &mixer->src[0];
 
-	/*
-         * Proxy the call to the UVC source.  The source enumerates its
-         * own native resolutions; we double the height in the result.
-         */
 	ret = MIXER_CALL_OP(src, vidioc_enum_framesizes, src->filp, src->fh,
 			    fsize);
 	mutex_unlock(&mixer->src_disc_lock);
@@ -1439,9 +2078,9 @@ static int mixer_vidioc_enum_framesizes(struct file *file, void *fh,
 		return ret;
 
 	/*
-         * The UVC driver returns DISCRETE entries.  Double the height
-         * to represent the stitched output.
-         */
+     * The UVC driver returns DISCRETE entries.  Double the height
+     * to represent the stitched output.
+     */
 	if (fsize->type == V4L2_FRMSIZE_TYPE_DISCRETE) {
 		fsize->discrete.height *= 2;
 	} else if (fsize->type == V4L2_FRMSIZE_TYPE_STEPWISE ||
@@ -1495,44 +2134,57 @@ static int mixer_vidioc_enum_frameintervals(struct file *file, void *fh,
 	return ret;
 }
 
+static int mixer_fop_open(struct file *file)
+{
+    struct proxy_mixer *mixer = video_drvdata(file);
+    int ret = v4l2_fh_open(file);
+    if (ret)
+        return ret;
+
+    /* Capture inode address_space for unmap_mapping_range */
+    if (!mixer->mapping)
+        mixer->mapping = file_inode(file)->i_mapping;
+    return 0;
+}
+
 const struct v4l2_ioctl_ops mixer_ioctl_ops = {
 	// clang-format off
-        .vidioc_querycap         = mixer_vidioc_querycap,
-        .vidioc_enum_fmt_vid_cap = mixer_vidioc_enum_fmt,
-        .vidioc_g_fmt_vid_cap    = mixer_vidioc_g_fmt,
-        .vidioc_s_fmt_vid_cap    = mixer_vidioc_s_fmt,
-        .vidioc_try_fmt_vid_cap  = mixer_vidioc_try_fmt,
+    .vidioc_querycap         = mixer_vidioc_querycap,
+    .vidioc_enum_fmt_vid_cap = mixer_vidioc_enum_fmt,
+    .vidioc_g_fmt_vid_cap    = mixer_vidioc_g_fmt,
+    .vidioc_s_fmt_vid_cap    = mixer_vidioc_s_fmt,
+    .vidioc_try_fmt_vid_cap  = mixer_vidioc_try_fmt,
 
-        .vidioc_s_input          = mixer_vidioc_s_input,
-        .vidioc_g_input          = mixer_vidioc_g_input,
-        .vidioc_enum_input       = mixer_vidioc_enum_input,
+    .vidioc_s_input          = mixer_vidioc_s_input,
+    .vidioc_g_input          = mixer_vidioc_g_input,
+    .vidioc_enum_input       = mixer_vidioc_enum_input,
 
-        .vidioc_g_parm           = mixer_vidioc_g_parm,
-        .vidioc_s_parm           = mixer_vidioc_s_parm,
+    .vidioc_g_parm           = mixer_vidioc_g_parm,
+    .vidioc_s_parm           = mixer_vidioc_s_parm,
 
-        .vidioc_enum_framesizes      = mixer_vidioc_enum_framesizes,
-        .vidioc_enum_frameintervals  = mixer_vidioc_enum_frameintervals,
+    .vidioc_enum_framesizes      = mixer_vidioc_enum_framesizes,
+    .vidioc_enum_frameintervals  = mixer_vidioc_enum_frameintervals,
 
-        .vidioc_reqbufs          = vb2_ioctl_reqbufs,
-        .vidioc_querybuf         = vb2_ioctl_querybuf,
-        .vidioc_qbuf             = vb2_ioctl_qbuf,
-        .vidioc_dqbuf            = vb2_ioctl_dqbuf,
-        .vidioc_expbuf           = vb2_ioctl_expbuf,
+    .vidioc_reqbufs          = vb2_ioctl_reqbufs,
+    .vidioc_querybuf         = vb2_ioctl_querybuf,
+    .vidioc_qbuf             = vb2_ioctl_qbuf,
+    .vidioc_dqbuf            = vb2_ioctl_dqbuf,
+    .vidioc_expbuf           = vb2_ioctl_expbuf,
 
-        .vidioc_streamon         = mixer_vidioc_streamon,
-        .vidioc_streamoff        = mixer_vidioc_streamoff,
+    .vidioc_streamon         = mixer_vidioc_streamon,
+    .vidioc_streamoff        = mixer_vidioc_streamoff,
 	// clang-format on
 };
 
 const struct v4l2_file_operations mixer_fops = {
 	// clang-format off
-        .owner          = THIS_MODULE,
-        .open           = v4l2_fh_open,
-        .release        = vb2_fop_release,
-        .unlocked_ioctl = video_ioctl2,
-        .mmap           = vb2_fop_mmap,
-        .read           = vb2_fop_read,
-        .poll           = vb2_fop_poll,
+    .owner          = THIS_MODULE,
+    .open           = mixer_fop_open,
+    .release        = vb2_fop_release,
+    .unlocked_ioctl = video_ioctl2,
+    .mmap           = vb2_fop_mmap,
+    .read           = vb2_fop_read,
+    .poll           = vb2_fop_poll,
 	// clang-format on
 };
 

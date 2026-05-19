@@ -839,11 +839,8 @@ static void mixer_qbuf_src(struct proxy_mixer *mixer, int slot)
 static void mixer_stitch_half_raw(u8 *dst, const u8 *src0, const u8 *src1,
 				  u64 raw_size)
 {
-	u8 *dst_frame_top = dst;
-	u8 *dst_frame_bottom = dst + raw_size;
-
-	memcpy(dst_frame_top, src0, raw_size);
-	memcpy(dst_frame_bottom, src1, raw_size);
+	memcpy(dst, src0, raw_size);
+	memcpy(dst + raw_size, src1, raw_size);
 }
 
 static int mixer_thread_fn(void *data)
@@ -854,13 +851,17 @@ static int mixer_thread_fn(void *data)
 	unsigned long flags;
 	u64 src_data_size;
 	u32 pixfmt;
+    u32 output_size;
 	int ret;
 
 	sched_set_fifo(current);
 
 	mutex_lock(&mixer->lock);
 	pixfmt = mixer->out_pixfmt;
+    output_size = mixer_image_size(mixer->out_width, mixer->out_height, pixfmt);
 	mutex_unlock(&mixer->lock);
+
+    src_data_size = (u64) output_size / 2;
 
 	while (!kthread_should_stop()) {
 		ret = wait_event_interruptible(
@@ -960,16 +961,10 @@ static int mixer_thread_fn(void *data)
 				continue;
 			}
 
-			src_data_size = (u64)mixer_image_size(
-				mixer->src_width, mixer->src_height, pixfmt);
-
 			mixer_stitch_half_raw(dst, src0, src1, src_data_size);
 		}
 
-		vb2_set_plane_payload(out_vb, 0,
-				      mixer_image_size(mixer->out_width,
-						       mixer->out_height,
-						       pixfmt));
+		vb2_set_plane_payload(out_vb, 0, output_size);
 		out_vb->timestamp = ktime_get_ns();
 		vb2_buffer_done(out_vb, VB2_BUF_STATE_DONE);
 

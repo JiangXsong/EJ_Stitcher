@@ -241,7 +241,7 @@ static void mixer_zc_return_sources(struct mixer_zc_buf *zbuf,
 static vm_fault_t mixer_zc_vm_fault(struct vm_fault *vmf)
 {
 	struct mixer_zc_buf *zbuf = vmf->vma->vm_private_data;
-	unsigned long pgoff = vmf->pgoff;
+	unsigned long pgoff = vmf->pgoff - vmf->vma->vm_pgoff;
 	struct page *page;
 
 	if (!zbuf || pgoff >= zbuf->num_pages)

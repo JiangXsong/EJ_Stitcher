@@ -162,9 +162,15 @@ struct proxy_mixer {
 	 * dma_slots: per-output-buffer dma_buf tracking.
 	 * out_vb_map: UVC buffer index → output vb2_buffer pointer.
 	 * num_dmabuf_slots: number of active dma_slots.
+	 * bufs_in_flight: number of output buffers currently queued to UVC
+	 *                 sources.  Used as back-pressure: the kthread waits
+	 *                 for this to be >0 before entering the blocking
+	 *                 DQBUF, preventing a deadlock when the consumer
+	 *                 (ffplay/ffmpeg) is slower than the producer.
 	 */
 	bool use_dmabuf;
 	unsigned int num_dmabuf_slots;
+	atomic_t bufs_in_flight;
 	struct mixer_dmabuf_slot dma_slots[MIXER_MAX_OUT_BUFS];
 	struct vb2_buffer *out_vb_map[MIXER_MAX_OUT_BUFS];
 };
@@ -1282,6 +1288,7 @@ static int mixer_uvc_start(struct proxy_mixer *mixer)
 		{
 			unsigned long flags;
 			struct mixer_buffer *mbuf;
+			unsigned int prequeued = 0;
 
 			spin_lock_irqsave(&mixer->out_q.irqlock, flags);
 			while (!list_empty(&mixer->out_q.irqqueue)) {
@@ -1298,10 +1305,15 @@ static int mixer_uvc_start(struct proxy_mixer *mixer)
 					if (ret)
 						goto err_dmabuf;
 				}
+				prequeued++;
 
 				spin_lock_irqsave(&mixer->out_q.irqlock, flags);
 			}
 			spin_unlock_irqrestore(&mixer->out_q.irqlock, flags);
+
+			atomic_set(&mixer->bufs_in_flight, prequeued);
+			pr_info("proxy_mixer: pre-queued %u buffers to UVC sources\n",
+				prequeued);
 		}
 	} else {
 		pr_info("proxy_mixer: using memcpy fallback\n");
@@ -1499,6 +1511,31 @@ static int mixer_thread_fn(void *data)
 			unsigned int idx0, idx1;
 			int i;
 
+			/*
+			 * Back-pressure: wait until at least one output buffer
+			 * is queued to UVC sources OR userspace has re-QBUF'd
+			 * a buffer we can submit.
+			 *
+			 * Without this gate the kthread drains all output
+			 * buffers via DQBUF faster than a slow consumer
+			 * (e.g. ffmpeg/x264) can recycle them, then blocks
+			 * forever in the UVC DQBUF below — while the
+			 * consumer's re-QBUF'd buffers pile up in irqqueue
+			 * with nobody to re-submit them.  Classic deadlock.
+			 */
+			ret = wait_event_interruptible(
+				mixer->out_q.buf_wq,
+				atomic_read(&mixer->bufs_in_flight) > 0 ||
+				!list_empty(&mixer->out_q.irqqueue) ||
+				kthread_should_stop() ||
+				!atomic_read(&mixer->streaming));
+
+			if (kthread_should_stop() ||
+			    !atomic_read(&mixer->streaming))
+				break;
+			if (ret == -ERESTARTSYS)
+				continue;
+
 			/**
 			 * re-submit any output buffers that
 			 * userspace has re-QBUF'd (added to irqqueue
@@ -1516,6 +1553,7 @@ static int mixer_thread_fn(void *data)
 					mixer_dmabuf_qbuf_src(mixer, s, i,
 							              mixer->dma_slots[i].cached_fd[s]);
 				}
+				atomic_inc(&mixer->bufs_in_flight);
 
 				spin_lock_irqsave(&mixer->out_q.irqlock, flags);
 			}
@@ -1523,6 +1561,15 @@ static int mixer_thread_fn(void *data)
 
 			if (!atomic_read(&mixer->streaming))
 				break;
+
+			/*
+			 * Double-check: if only the irqqueue leg woke us and
+			 * the re-QBUF loop pushed bufs_in_flight above zero,
+			 * we are good.  If somehow still zero, loop back to
+			 * wait rather than entering the blocking DQBUF.
+			 */
+			if (atomic_read(&mixer->bufs_in_flight) <= 0)
+				continue;
 
 			/**
 			 * DQBUF from both sources (blocking).
@@ -1583,6 +1630,7 @@ static int mixer_thread_fn(void *data)
 			vb2_set_plane_payload(out_vb, 0, out_size);
 			out_vb->timestamp = ktime_get_ns();
 			vb2_buffer_done(out_vb, VB2_BUF_STATE_DONE);
+			atomic_dec(&mixer->bufs_in_flight);
 		}
 
 dmabuf_exit:

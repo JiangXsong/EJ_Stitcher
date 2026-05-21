@@ -26,8 +26,8 @@
 #define MIXER_SRC_NUM_BUFS  4
 #define MIXER_OUT_NUM_BUFS  4
 #define MIXER_MAX_OUT_BUFS	8
-#define MIXER_SYNC_TOLERANCE_US 16667ULL /* half frame @ 30fps */
-#define MIXER_SYNC_MAX_DROP 8
+#define MIXER_SYNC_DRAIN_FRAMES 4  /* warm-up pairs to drain per attempt */
+#define MIXER_SYNC_MAX_RETRIES  3  /* STREAMOFF/ON retries on seq offset */
 
 #define MIXER_DEFAULT_VID   0x1E4E
 #define MIXER_DEFAULT_PID_P 0x7301
@@ -66,12 +66,10 @@ struct mixer_slot {
 	struct vb2_queue *vbq;
 	struct v4l2_format fmt;
 
-	/* Current buffer, dequeued from vb2 queue */
 	struct vb2_buffer *cur_vb;
 	ktime_t cur_ts;
 	bool buf_ready;
 
-	/* Related USB device */
 	struct usb_device *udev;
 };
 
@@ -79,8 +77,8 @@ struct mixer_slot {
 struct mixer_dmabuf_priv {
 	struct page **pages;
 	unsigned int num_pages;
-	unsigned int offset;/* byte offset within first page */
-	size_t size;/* total byte length */
+	unsigned int offset; /* byte offset within first page */
+	size_t size; /* total byte length */
 };
 
 /*
@@ -151,23 +149,11 @@ struct proxy_mixer {
 	struct mixer_video_queue out_q;
 	bool out_q_initialized;
 
-	struct mutex uvc_ctrl_lock; /* Protects UVC control operations */
+	struct mutex uvc_ctrl_lock;
 
 	struct task_struct *mixer_task;
 	atomic_t streaming;
 
-	/*
-	 * DMABUF feed-through state.
-	 * use_dmabuf: resolved at start_streaming (zerocopy && VB2_DMABUF ok).
-	 * dma_slots: per-output-buffer dma_buf tracking.
-	 * out_vb_map: UVC buffer index → output vb2_buffer pointer.
-	 * num_dmabuf_slots: number of active dma_slots.
-	 * bufs_in_flight: number of output buffers currently queued to UVC
-	 *                 sources.  Used as back-pressure: the kthread waits
-	 *                 for this to be >0 before entering the blocking
-	 *                 DQBUF, preventing a deadlock when the consumer
-	 *                 (ffplay/ffmpeg) is slower than the producer.
-	 */
 	bool use_dmabuf;
 	unsigned int num_dmabuf_slots;
 	atomic_t bufs_in_flight;
@@ -186,6 +172,7 @@ static void mixer_unregister_class_intf(struct proxy_mixer *mixer);
 static void mixer_unregister(struct proxy_mixer *mixer);
 static int init_queue(struct mixer_video_queue *q);
 static void mixer_queue_release(struct mixer_video_queue *q);
+static int mixer_thread_fn(void *data);
 
 static struct proxy_mixer *g_mixer;
 
@@ -198,7 +185,7 @@ MODULE_PARM_DESC(zerocopy, "Enable DMABUF feed-through zero-copy (default: true)
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Syu-Song Chiang");
-MODULE_DESCRIPTION("V4L2 Proxy-Mixer: combine two UVC sources in kernel space");
+MODULE_DESCRIPTION("V4L2 Proxy-Teaming: Stitching two UVC sources in kernel space");
 MODULE_IMPORT_NS("DMA_BUF");
 
 /* ------------------------------------------------------------------ */
@@ -237,7 +224,7 @@ static inline bool mixer_pixfmt_valid(u32 pixfmt)
 /* dma_buf exporter ops                                               */
 /* ------------------------------------------------------------------ */
 static int mixer_dmabuf_attach(struct dma_buf *dbuf,
-			       struct dma_buf_attachment *attach)
+			                   struct dma_buf_attachment *attach)
 {
 	struct mixer_dmabuf_attach *a;
 
@@ -250,7 +237,7 @@ static int mixer_dmabuf_attach(struct dma_buf *dbuf,
 }
 
 static void mixer_dmabuf_detach(struct dma_buf *dbuf,
-				struct dma_buf_attachment *attach)
+				                struct dma_buf_attachment *attach)
 {
 	struct mixer_dmabuf_attach *a = attach->priv;
 
@@ -325,8 +312,8 @@ static struct sg_table *mixer_dmabuf_map(struct dma_buf_attachment *attach,
  * static (pinned) backing pages.
  */
 static void mixer_dmabuf_unmap(struct dma_buf_attachment *attach,
-			       struct sg_table *sgt,
-			       enum dma_data_direction dir)
+			                   struct sg_table *sgt,
+			                   enum dma_data_direction dir)
 {
 	/* Cached — freed on detach, not here */
 }
@@ -342,14 +329,14 @@ static void mixer_dmabuf_unpin(struct dma_buf_attachment *attach)
 }
 
 static int mixer_dmabuf_begin_cpu_access(struct dma_buf *dbuf,
-					 enum dma_data_direction dir)
+				                    	 enum dma_data_direction dir)
 {
 	/* x86: cache-coherent, no action needed */
 	return 0;
 }
 
 static int mixer_dmabuf_end_cpu_access(struct dma_buf *dbuf,
-				       enum dma_data_direction dir)
+				                       enum dma_data_direction dir)
 {
 	return 0;
 }
@@ -374,33 +361,34 @@ static int mixer_dmabuf_vmap(struct dma_buf *dbuf, struct iosys_map *map)
 
 static void mixer_dmabuf_vunmap(struct dma_buf *dbuf, struct iosys_map *map)
 {
+    struct mixer_dmabuf_priv *priv;
 	void *va = map->vaddr;
 
 	if (va) {
-		struct mixer_dmabuf_priv *priv = dbuf->priv;
-
+		priv = dbuf->priv;
 		vunmap(va - priv->offset);
 	}
 }
 
 static const struct dma_buf_ops mixer_dmabuf_ops = {
-	.attach = mixer_dmabuf_attach,
-	.detach = mixer_dmabuf_detach,
-	.pin = mixer_dmabuf_pin,
-	.unpin = mixer_dmabuf_unpin,
-	.map_dma_buf = mixer_dmabuf_map,
-	.unmap_dma_buf = mixer_dmabuf_unmap,
+    // clang-format off
+	.attach           = mixer_dmabuf_attach,
+	.detach           = mixer_dmabuf_detach,
+	.pin              = mixer_dmabuf_pin,
+	.unpin            = mixer_dmabuf_unpin,
+	.map_dma_buf      = mixer_dmabuf_map,
+	.unmap_dma_buf    = mixer_dmabuf_unmap,
 	.begin_cpu_access = mixer_dmabuf_begin_cpu_access,
-	.end_cpu_access = mixer_dmabuf_end_cpu_access,
-	.release = mixer_dmabuf_release,
-	.vmap = mixer_dmabuf_vmap,
-	.vunmap = mixer_dmabuf_vunmap,
+	.end_cpu_access   = mixer_dmabuf_end_cpu_access,
+	.release          = mixer_dmabuf_release,
+	.vmap             = mixer_dmabuf_vmap,
+	.vunmap           = mixer_dmabuf_vunmap,
+    // clang-format on
 };
 
 /* ------------------------------------------------------------------ */
 /* DMABUF management helpers                                          */
 /* ------------------------------------------------------------------ */
-
 /**
  * mixer_create_dmabuf - export a byte range of a vmalloc page array as dma_buf.
  *
@@ -417,8 +405,8 @@ static struct dma_buf *mixer_create_dmabuf(struct page **pages,
 					                       unsigned int offset, size_t size)
 {
 	struct mixer_dmabuf_priv *priv;
-	DEFINE_DMA_BUF_EXPORT_INFO(exp_info);
 	struct dma_buf *dbuf;
+	DEFINE_DMA_BUF_EXPORT_INFO(exp_info);
 
 	priv = kzalloc(sizeof(*priv), GFP_KERNEL);
 	if (!priv)
@@ -442,7 +430,8 @@ static struct dma_buf *mixer_create_dmabuf(struct page **pages,
 }
 
 static int mixer_dqbuf_src_dmabuf(struct proxy_mixer *mixer, int slot,
-                                  unsigned int *out_index)
+                                  unsigned int *out_index,
+                                  u32 *out_sequence)
 {
 	struct mixer_slot *src = &mixer->src[slot];
 	struct v4l2_buffer buf = {
@@ -453,7 +442,7 @@ static int mixer_dqbuf_src_dmabuf(struct proxy_mixer *mixer, int slot,
 
 	if (IS_ERR_OR_NULL(src->filp) || !src->vdev) {
 		pr_info("proxy_mixer: src%d dqbuf skipped (invalid state)\n",
-			slot);
+			    slot);
 		return -ENODEV;
 	}
 
@@ -465,7 +454,9 @@ static int mixer_dqbuf_src_dmabuf(struct proxy_mixer *mixer, int slot,
 		return ret;
 	}
 
-    *out_index = buf.index;
+	*out_index = buf.index;
+	if (out_sequence)
+		*out_sequence = buf.sequence;
 	return 0;
 }
 
@@ -476,7 +467,7 @@ static int mixer_dqbuf_src_dmabuf(struct proxy_mixer *mixer, int slot,
  *      Can be a temporary fd (initial QBUF) or cached fd (re-QBUF).
  */
 static int mixer_dmabuf_qbuf_src(struct proxy_mixer *mixer, int slot,
-				 unsigned int buf_index, int fd)
+				                 unsigned int buf_index, int fd)
 {
 	struct mixer_slot *src = &mixer->src[slot];
 	struct v4l2_buffer v4l2_buf = {
@@ -506,8 +497,8 @@ static int mixer_dmabuf_qbuf_src(struct proxy_mixer *mixer, int slot,
  * Used for initial pre-QBUF in ioctl context.
  */
 static int mixer_dmabuf_qbuf_with_tmpfd(struct proxy_mixer *mixer, int slot,
-					unsigned int buf_index,
-					struct dma_buf *dbuf)
+					                    unsigned int buf_index,
+				                    	struct dma_buf *dbuf)
 {
 	int fd, ret;
 
@@ -532,11 +523,12 @@ static int mixer_dmabuf_qbuf_with_tmpfd(struct proxy_mixer *mixer, int slot,
  */
 static int mixer_dmabuf_create_cached_fds(struct proxy_mixer *mixer)
 {
+    struct mixer_dmabuf_slot *ds;
 	unsigned int i;
 	int s, fd;
 
 	for (i = 0; i < mixer->num_dmabuf_slots; i++) {
-		struct mixer_dmabuf_slot *ds = &mixer->dma_slots[i];
+		ds = &mixer->dma_slots[i];
 
 		for (s = 0; s < MIXER_NUM_SOURCES; s++) {
 			if (!ds->dbuf[s])
@@ -553,7 +545,7 @@ static int mixer_dmabuf_create_cached_fds(struct proxy_mixer *mixer)
 			ds->cached_fd[s] = fd;
 
 			pr_debug("proxy_mixer: cached fd %d for slot%u src%d\n",
-				 fd, i, s);
+				     fd, i, s);
 		}
 	}
 	return 0;
@@ -567,10 +559,11 @@ static int mixer_dmabuf_create_cached_fds(struct proxy_mixer *mixer)
  */
 static void mixer_dmabuf_close_cached_fds(struct proxy_mixer *mixer)
 {
+    struct mixer_dmabuf_slot *ds;
 	unsigned int i, s;
 
 	for (i = 0; i < mixer->num_dmabuf_slots; i++) {
-		struct mixer_dmabuf_slot *ds = &mixer->dma_slots[i];
+		ds = &mixer->dma_slots[i];
 
 		for (s = 0; s < MIXER_NUM_SOURCES; s++) {
 			if (ds->cached_fd[s] >= 0) {
@@ -622,13 +615,14 @@ static int mixer_dmabuf_setup_slot(struct proxy_mixer *mixer,
 		}
 	}
 
-	/*
+	/**
 	 * Half A: bytes [0 .. half_size-1] → feed to src0
 	 * Half B: bytes [half_size .. frame_size-1] → feed to src1
 	 *
 	 * When half_size is NOT page-aligned, page at the split point is
-	 * shared between A and B.  sg_alloc_table_from_pages handles this
-	 * via the offset parameter — DMA hardware operates at byte level.
+	 * shared between A and B.
+     * sg_alloc_table_from_pages handles this via the offset parameter 
+     * — DMA hardware operates at byte level.
 	 */
 	a_num_pages = (half_size + PAGE_SIZE - 1) >> PAGE_SHIFT;
 	b_first_page = half_size >> PAGE_SHIFT;
@@ -650,7 +644,7 @@ static int mixer_dmabuf_setup_slot(struct proxy_mixer *mixer,
 
 	/* dma_buf for src1 (second half) */
 	ds->dbuf[1] = mixer_create_dmabuf(&ds->pages[b_first_page], b_num_pages,
-					   b_offset, frame_size - half_size);
+					                  b_offset, frame_size - half_size);
 	if (IS_ERR(ds->dbuf[1])) {
 		ret = PTR_ERR(ds->dbuf[1]);
 		ds->dbuf[1] = NULL;
@@ -664,9 +658,9 @@ static int mixer_dmabuf_setup_slot(struct proxy_mixer *mixer,
 		ds->cached_fd[i] = -1;
 
 	pr_debug("proxy_mixer: dmabuf slot buf%d: A=%u pages off=0 len=%u, "
-		 "B=%u pages off=%u len=%u\n",
-		 out_vb->index, a_num_pages, half_size,
-		 b_num_pages, b_offset, frame_size - half_size);
+		     "B=%u pages off=%u len=%u\n",
+		     out_vb->index, a_num_pages, half_size,
+		     b_num_pages, b_offset, frame_size - half_size);
 
 	return 0;
 
@@ -707,17 +701,16 @@ static void mixer_dmabuf_teardown_all(struct proxy_mixer *mixer)
 	mixer->num_dmabuf_slots = 0;
 }
 
-/*
+/**
  * mixer_dmabuf_check_support - check if both UVC sources support DMABUF import.
- * Must be called after sources are discovered (vbq populated).
  */
 static bool mixer_dmabuf_check_support(struct proxy_mixer *mixer)
 {
+    struct vb2_queue *vbq;
 	int i;
 
 	for (i = 0; i < MIXER_NUM_SOURCES; i++) {
-		struct vb2_queue *vbq = mixer->src[i].vbq;
-
+        vbq = mixer->src[i].vbq;
 		if (!vbq) {
 			pr_info("proxy_mixer: src%d vbq NULL, DMABUF not available\n", i);
 			return false;
@@ -730,9 +723,10 @@ static bool mixer_dmabuf_check_support(struct proxy_mixer *mixer)
 	return true;
 }
 
-
 /* ------------------------------------------------------------------ */
-/*
+/* Accessor vb2 helper                                                */
+/* ------------------------------------------------------------------ */
+/**
  * UVC vb2_queue accessor — see previous commit for full rationale.
  * Scans the opaque uvc_streaming allocation for a vb2_queue whose
  * drv_priv == &self (invariant set by uvc_queue_init).
@@ -1023,9 +1017,8 @@ static void mixer_unregister_class_intf(struct proxy_mixer *mixer)
 }
 
 /* ------------------------------------------------------------------ */
-/**
- * SRC UVC streaming control
- */
+/* SRC UVC streaming control                                          */
+/* ------------------------------------------------------------------ */
 static int mixer_uvc_check_slots(struct proxy_mixer *mixer)
 {
 	pr_info("proxy_mixer: checking source slots...\n");
@@ -1092,7 +1085,6 @@ static int mixer_uvc_negotiate_src_fps(struct proxy_mixer *mixer, int slot)
 
 	ret = MIXER_CALL_OP(src, vidioc_s_parm, src->filp, src->fh, &parm);
 	if (ret) {
-		/* Not fatal — some UVC devices don't support s_parm */
 		pr_info("proxy_mixer: src%d s_parm failed: %d (non-fatal)\n",
 			    slot, ret);
 		return 0;
@@ -1167,6 +1159,41 @@ static int mixer_uvc_reqbufs_dmabuf(struct proxy_mixer *mixer, int idx,
 	return 0;
 }
 
+static int mixer_uvc_start_pre_queue(struct proxy_mixer *mixer)
+{
+    unsigned long flags;
+    struct mixer_buffer *mbuf;
+    unsigned int i, j;
+    int ret;
+    unsigned int prequeued = 0;
+
+    spin_lock_irqsave(&mixer->out_q.irqlock, flags);
+    while (!list_empty(&mixer->out_q.irqqueue)) {
+        mbuf = list_first_entry(&mixer->out_q.irqqueue,
+                                struct mixer_buffer, queue);
+        list_del(&mbuf->queue);
+        spin_unlock_irqrestore(&mixer->out_q.irqlock, flags);
+
+        i = mbuf->buf.vb2_buf.index;
+        for (j = 0; j < MIXER_NUM_SOURCES; j++) {
+            ret = mixer_dmabuf_qbuf_with_tmpfd(mixer, j, i,
+                                               mixer->dma_slots[i].dbuf[j]);
+            if (ret)
+                return ret;
+        }
+        prequeued++;
+
+        spin_lock_irqsave(&mixer->out_q.irqlock, flags);
+    }
+    spin_unlock_irqrestore(&mixer->out_q.irqlock, flags);
+
+    atomic_set(&mixer->bufs_in_flight, prequeued);
+    pr_info("proxy_mixer: pre-queued %u buffers to UVC sources\n",
+            prequeued);
+
+    return 0;
+}
+
 static int mixer_uvc_streamon(struct proxy_mixer *mixer, int idx)
 {
 	enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
@@ -1210,15 +1237,12 @@ static void mixer_uvc_free_bufs(struct proxy_mixer *mixer, int idx)
 	MIXER_CALL_OP(src, vidioc_reqbufs, src->filp, src->fh, &req);
 }
 
-/* Forward declaration */
-static int mixer_thread_fn(void *data);
-
 static int mixer_uvc_start(struct proxy_mixer *mixer)
 {
 	unsigned int out_count;
 	unsigned int half_size;
 	unsigned int i;
-	int j, ret;
+	int ret;
 
 	/* Negotiate format and request buffers for each source */
 	mutex_lock(&mixer->uvc_ctrl_lock);
@@ -1285,42 +1309,15 @@ static int mixer_uvc_start(struct proxy_mixer *mixer)
 		 * Pre-queue all output buffers to UVC sources.
 		 * Take them from irqqueue (queued by userspace) and submit.
 		 */
-		{
-			unsigned long flags;
-			struct mixer_buffer *mbuf;
-			unsigned int prequeued = 0;
-
-			spin_lock_irqsave(&mixer->out_q.irqlock, flags);
-			while (!list_empty(&mixer->out_q.irqqueue)) {
-				mbuf = list_first_entry(&mixer->out_q.irqqueue,
-							            struct mixer_buffer, queue);
-				list_del(&mbuf->queue);
-				spin_unlock_irqrestore(&mixer->out_q.irqlock, flags);
-
-				i = mbuf->buf.vb2_buf.index;
-				for (j = 0; j < MIXER_NUM_SOURCES; j++) {
-					ret = mixer_dmabuf_qbuf_with_tmpfd(
-						mixer, j, i,
-						mixer->dma_slots[i].dbuf[j]);
-					if (ret)
-						goto err_dmabuf;
-				}
-				prequeued++;
-
-				spin_lock_irqsave(&mixer->out_q.irqlock, flags);
-			}
-			spin_unlock_irqrestore(&mixer->out_q.irqlock, flags);
-
-			atomic_set(&mixer->bufs_in_flight, prequeued);
-			pr_info("proxy_mixer: pre-queued %u buffers to UVC sources\n",
-				prequeued);
-		}
+        ret = mixer_uvc_start_pre_queue(mixer);
+        if (ret)
+            goto err_dmabuf;		
 	} else {
 		pr_info("proxy_mixer: using memcpy fallback\n");
 
 		for (i = 0; i < MIXER_NUM_SOURCES; i++) {
 			ret = mixer_uvc_reqbufs_mmap(mixer, i,
-						     MIXER_OUT_NUM_BUFS);
+						                 MIXER_OUT_NUM_BUFS);
 			if (ret)
 				goto err_out;
 		}
@@ -1370,28 +1367,25 @@ static void mixer_uvc_stop(struct proxy_mixer *mixer)
 
 	pr_info("proxy_mixer: stopping pipeline\n");
 
-	/* Phase 1: STREAMOFF — unblocks kthread's blocking DQBUF */
+	/* STREAMOFF — unblocks kthread's blocking DQBUF */
 	for (i = 0; i < MIXER_NUM_SOURCES; i++)
 		mixer_uvc_streamoff_only(mixer, i);
 
-	/* Phase 2: wake and stop kthread */
+	/* wake and stop kthread */
 	wake_up_all(&mixer->out_q.buf_wq);
 	if (mixer->mixer_task) {
 		kthread_stop(mixer->mixer_task);
 		mixer->mixer_task = NULL;
 	}
 
-	/*
-	 * Phase 3: REQBUFS(0) — releases UVC buffer slots.
+	/**
+	 * REQBUFS(0) — releases UVC buffer slots.
 	 * For DMABUF mode: vb2 detaches our dma_bufs (dma_buf_put).
 	 */
 	for (i = 0; i < MIXER_NUM_SOURCES; i++)
 		mixer_uvc_free_bufs(mixer, i);
 
-	/*
-	 * Phase 4: destroy our dma_bufs.
-	 * Safe now — UVC dropped its references in Phase 3.
-	 */
+	/* Destroy dma_bufs. */
 	if (mixer->use_dmabuf)
 		mixer_dmabuf_teardown_all(mixer);
 
@@ -1460,10 +1454,53 @@ static void mixer_qbuf_src_mmap(struct proxy_mixer *mixer, int slot)
 
 /* Memcpy */
 static void mixer_stitch_memcpy(u8 *dst, const u8 *src0, const u8 *src1,
-				  u64 raw_size)
+				                u64 raw_size)
 {
 	memcpy(dst, src0, raw_size);
 	memcpy(dst + raw_size, src1, raw_size);
+}
+
+/**
+ * mixer_dmabuf_resync_sources - STREAMOFF + re-QBUF + STREAMON both sources.
+ *
+ * Resets both UVC sources so their sequence counters restart at 0.
+ * Used when the warm-up drain detects a sequence offset caused by an
+ * asymmetric -EPROTO at initial STREAMON.
+ *
+ * Must be called from kthread context with cached FDs already created.
+ */
+static int mixer_dmabuf_resync_sources(struct proxy_mixer *mixer)
+{
+	unsigned int i, s;
+	int ret;
+
+	/* STREAMOFF both — stops URBs, resets UVC state */
+	for (s = 0; s < MIXER_NUM_SOURCES; s++)
+		mixer_uvc_streamoff_only(mixer, s);
+
+	/* Re-QBUF all output buffers to both sources */
+	for (i = 0; i < mixer->num_dmabuf_slots; i++) {
+		for (s = 0; s < MIXER_NUM_SOURCES; s++) {
+			ret = mixer_dmabuf_qbuf_src(mixer, s, i,
+					mixer->dma_slots[i].cached_fd[s]);
+			if (ret) {
+				pr_err("proxy_mixer: resync re-QBUF "
+				       "slot %u src%u failed: %d\n",
+				       i, s, ret);
+				return ret;
+			}
+		}
+	}
+
+	/* STREAMON both — UVC resets sequence counter, submits URBs */
+	for (s = 0; s < MIXER_NUM_SOURCES; s++) {
+		ret = mixer_uvc_streamon(mixer, s);
+		if (ret)
+			return ret;
+	}
+
+	atomic_set(&mixer->bufs_in_flight, mixer->num_dmabuf_slots);
+	return 0;
 }
 
 static int mixer_thread_fn(void *data)
@@ -1507,8 +1544,98 @@ static int mixer_thread_fn(void *data)
 			goto dmabuf_exit;
 		}
 
+		/*
+		 * Warm-up sync: drain initial frame pairs and retry on
+		 * sequence offset.
+		 *
+		 * At STREAMON the two sources may start at different
+		 * times (alt-setting switch latency) and a transient
+		 * -EPROTO can widen the gap.  We drain N pairs to skip
+		 * damaged frames, then compare sequences.
+		 *
+		 * If the sequences don't match, we STREAMOFF + STREAMON
+		 * both sources to reset their sequence counters and try
+		 * again.  The EPROTO is probabilistic, so retries have
+		 * a high chance of clean sync.
+		 *
+		 * Critical: always DQBUF/re-QBUF both sources equally.
+		 * An unequal count shifts one FIFO permanently, causing
+		 * an irrecoverable buffer-index mismatch.
+		 */
+		{
+			unsigned int w_idx0, w_idx1;
+			u32 w_seq0, w_seq1;
+			int attempt, n;
+			bool synced = false;
+
+			for (attempt = 0; attempt <= MIXER_SYNC_MAX_RETRIES;
+			     attempt++) {
+				w_seq0 = 0;
+				w_seq1 = 0;
+
+				for (n = 0; n < MIXER_SYNC_DRAIN_FRAMES; n++) {
+					ret = mixer_dqbuf_src_dmabuf(
+						mixer, 0, &w_idx0, &w_seq0);
+					if (ret)
+						goto dmabuf_exit;
+
+					ret = mixer_dqbuf_src_dmabuf(
+						mixer, 1, &w_idx1, &w_seq1);
+					if (ret) {
+						mixer_dmabuf_qbuf_src(
+							mixer, 0, w_idx0,
+							mixer->dma_slots[w_idx0].cached_fd[0]);
+						goto dmabuf_exit;
+					}
+
+					/* Discard pair — re-QBUF both */
+					mixer_dmabuf_qbuf_src(
+						mixer, 0, w_idx0,
+						mixer->dma_slots[w_idx0].cached_fd[0]);
+					mixer_dmabuf_qbuf_src(
+						mixer, 1, w_idx1,
+						mixer->dma_slots[w_idx1].cached_fd[1]);
+				}
+
+				if (w_seq0 == w_seq1) {
+					synced = true;
+					pr_info("proxy_mixer: synced at seq %u "
+						"(attempt %d, drained %d)\n",
+						w_seq0, attempt,
+						MIXER_SYNC_DRAIN_FRAMES);
+					break;
+				}
+
+				if (attempt < MIXER_SYNC_MAX_RETRIES) {
+					pr_info("proxy_mixer: seq offset "
+						"%u vs %u after drain, "
+						"resetting sources "
+						"(attempt %d/%d)\n",
+						w_seq0, w_seq1, attempt,
+						MIXER_SYNC_MAX_RETRIES);
+
+					ret = mixer_dmabuf_resync_sources(
+						mixer);
+					if (ret) {
+						pr_err("proxy_mixer: "
+						       "resync failed: %d\n",
+						       ret);
+						goto dmabuf_exit;
+					}
+				}
+			}
+
+			if (!synced)
+				pr_warn("proxy_mixer: sync failed after "
+					"%d retries (seq %u vs %u), "
+					"proceeding\n",
+					MIXER_SYNC_MAX_RETRIES,
+					w_seq0, w_seq1);
+		}
+
 		while (!kthread_should_stop()) {
 			unsigned int idx0, idx1;
+			u32 seq0 = 0, seq1 = 0;
 			int i;
 
 			/*
@@ -1561,13 +1688,6 @@ static int mixer_thread_fn(void *data)
 
 			if (!atomic_read(&mixer->streaming))
 				break;
-
-			/*
-			 * Double-check: if only the irqqueue leg woke us and
-			 * the re-QBUF loop pushed bufs_in_flight above zero,
-			 * we are good.  If somehow still zero, loop back to
-			 * wait rather than entering the blocking DQBUF.
-			 */
 			if (atomic_read(&mixer->bufs_in_flight) <= 0)
 				continue;
 
@@ -1576,7 +1696,7 @@ static int mixer_thread_fn(void *data)
 			 * Both complete the same output buffer (same HC,
 			 * same frame clock, FIFO order).
 			 */
-			ret = mixer_dqbuf_src_dmabuf(mixer, 0, &idx0);
+			ret = mixer_dqbuf_src_dmabuf(mixer, 0, &idx0, &seq0);
 			if (ret) {
 				if (!atomic_read(&mixer->streaming))
 					break;
@@ -1585,7 +1705,7 @@ static int mixer_thread_fn(void *data)
 				continue;
 			}
 
-			ret = mixer_dqbuf_src_dmabuf(mixer, 1, &idx1);
+			ret = mixer_dqbuf_src_dmabuf(mixer, 1, &idx1, &seq1);
 			if (ret) {
 				/* Re-QBUF src0 using cached fd */
 				mixer_dmabuf_qbuf_src(
@@ -1611,6 +1731,25 @@ static int mixer_thread_fn(void *data)
 			}
 
 			/*
+			 * Runtime sequence check.  Do NOT advance a single
+			 * source — that permanently breaks index alignment.
+			 * Just discard and continue in lockstep.
+			 */
+			if (seq0 != seq1) {
+				pr_warn_ratelimited(
+					"proxy_mixer: seq mismatch %u vs %u, "
+					"discarding pair idx %u\n",
+					seq0, seq1, idx0);
+				mixer_dmabuf_qbuf_src(
+					mixer, 0, idx0,
+					mixer->dma_slots[idx0].cached_fd[0]);
+				mixer_dmabuf_qbuf_src(
+					mixer, 1, idx1,
+					mixer->dma_slots[idx1].cached_fd[1]);
+				continue;
+			}
+
+			/**
 			 * Output buffer idx0 is filled by DMA.
 			 * Set payload + timestamp and signal done.
 			 */
@@ -1756,8 +1895,8 @@ static void mixer_video_queue_return_buffers(struct mixer_video_queue *q,
 }
 
 static int mixer_queue_setup(struct vb2_queue *vbq, unsigned int *num_buffers,
-			     unsigned int *num_planes, unsigned int sizes[],
-			     struct device *alloc_devs[])
+			                 unsigned int *num_planes, unsigned int sizes[],
+			                 struct device *alloc_devs[])
 {
 	struct mixer_video_queue *q = vb2_get_drv_priv(vbq);
 	struct proxy_mixer *mixer = container_of(q, struct proxy_mixer, out_q);
@@ -1765,11 +1904,11 @@ static int mixer_queue_setup(struct vb2_queue *vbq, unsigned int *num_buffers,
 
 	mutex_lock(&mixer->lock);
 	size = mixer_image_size(mixer->out_width, mixer->out_height,
-				mixer->out_pixfmt);
+				            mixer->out_pixfmt);
 	mutex_unlock(&mixer->lock);
 
 	pr_debug("proxy_mixer: queue_setup (nplanes=%d, nbuffers=%d)\n",
-		 *num_planes, *num_buffers);
+     		 *num_planes, *num_buffers);
 	if (*num_planes)
 		return sizes[0] < size ? -EINVAL : 0;
 
@@ -1778,7 +1917,7 @@ static int mixer_queue_setup(struct vb2_queue *vbq, unsigned int *num_buffers,
 	*num_buffers = clamp_t(unsigned int, *num_buffers, 2, MIXER_MAX_OUT_BUFS);
 
 	pr_info("proxy_mixer: queue_setup size=%u buffers=%u\n",
-		size, *num_buffers);
+	    	size, *num_buffers);
 	return 0;
 }
 
@@ -1793,13 +1932,6 @@ static int mixer_buf_prepare(struct vb2_buffer *vb)
 				mixer->out_pixfmt);
 	mutex_unlock(&mixer->lock);
 
-	// pr_debug("proxy_mixer: buf_prepare idx=%d, size requirement=%u\n",
-	// 	 vb->index, size);
-	// if (vb->index >= q->vbq.max_num_buffers) {
-	// 	pr_err("proxy_mixer: buffer index %d out of range\n",
-	// 	       vb->index);
-	// 	return -EINVAL;
-	// }
 	if (vb2_plane_size(vb, 0) < size) {
 		pr_err("proxy_mixer: buffer plane size < required %d\n", size);
 		return -EINVAL;
@@ -1817,7 +1949,6 @@ static void mixer_buf_queue(struct vb2_buffer *vb)
 	unsigned long flags;
 
 	pr_debug("proxy_mixer: buf_queue idx=%d\n", vb->index);
-	// mbuf->state = BUF_STATE_QUEUED;
 
 	spin_lock_irqsave(&q->irqlock, flags);
 	list_add_tail(&mbuf->queue, &q->irqqueue);
@@ -1847,7 +1978,7 @@ static int mixer_start_streaming(struct vb2_queue *vbq, unsigned int count)
 		mixer_video_queue_return_buffers(q, VB2_BUF_STATE_QUEUED);
 		spin_unlock_irqrestore(&q->irqlock, flags);
 
-		/*
+		/**
 		 * DMABUF mode: some buffers may have been taken from
 		 * irqqueue and submitted to UVC before the error.
 		 * UVC free_bufs already ran, but our vb2 still holds
@@ -1886,7 +2017,7 @@ static void mixer_stop_streaming(struct vb2_queue *vbq)
 	mixer_video_queue_return_buffers(q, VB2_BUF_STATE_ERROR);
 	spin_unlock_irqrestore(&q->irqlock, flags);
 
-	/*
+	/**
 	 * Return ALL remaining active buffers.
 	 *
 	 * In DMABUF mode, output buffers are submitted to UVC sources
@@ -1956,12 +2087,9 @@ static int init_queue(struct mixer_video_queue *q)
 }
 
 /* ------------------------------------------------------------------ */
-/**
- * vidioc_streamon
- * Check if sources are ready
- */
+/* vidioc_streamon */
 static int mixer_vidioc_streamon(struct file *file, void *fh,
-				 enum v4l2_buf_type type)
+				                 enum v4l2_buf_type type)
 {
 	struct proxy_mixer *mixer = video_drvdata(file);
 	int ret;
@@ -1987,7 +2115,7 @@ static int mixer_vidioc_streamon(struct file *file, void *fh,
  * then call vb2_ioctl_streamoff to complete the stream off process
  */
 static int mixer_vidioc_streamoff(struct file *file, void *fh,
-				  enum v4l2_buf_type type)
+				                  enum v4l2_buf_type type)
 {
 	pr_info("proxy_mixer: vidioc_streamoff called (type=%d)\n", type);
 	if (type != V4L2_BUF_TYPE_VIDEO_CAPTURE) {
@@ -1999,7 +2127,7 @@ static int mixer_vidioc_streamoff(struct file *file, void *fh,
 }
 
 static int mixer_vidioc_querycap(struct file *file, void *fh,
-				 struct v4l2_capability *cap)
+	                			 struct v4l2_capability *cap)
 {
 	strscpy(cap->driver, "proxy_mixer", sizeof(cap->driver));
 	strscpy(cap->card, "Proxy Video Mixer", sizeof(cap->card));
@@ -2015,7 +2143,7 @@ static const u32 mixer_formats[] = {
 #define MIXER_NUM_FORMATS ARRAY_SIZE(mixer_formats)
 
 static int mixer_vidioc_enum_fmt(struct file *file, void *fh,
-				 struct v4l2_fmtdesc *fmtdesc)
+			                	 struct v4l2_fmtdesc *fmtdesc)
 {
 	if (fmtdesc->type != V4L2_BUF_TYPE_VIDEO_CAPTURE)
 		return -EINVAL;
@@ -2042,7 +2170,7 @@ static void fill_fmt(struct proxy_mixer *mixer, struct v4l2_format *f)
 }
 
 static int mixer_vidioc_g_fmt(struct file *file, void *fh,
-			      struct v4l2_format *fmt)
+			                  struct v4l2_format *fmt)
 {
 	struct proxy_mixer *mixer = video_drvdata(file);
 
@@ -2054,20 +2182,18 @@ static int mixer_vidioc_g_fmt(struct file *file, void *fh,
 }
 
 static int mixer_vidioc_s_fmt(struct file *file, void *fh,
-			      struct v4l2_format *fmt)
+            			      struct v4l2_format *fmt)
 {
 	struct proxy_mixer *mixer = video_drvdata(file);
 
 	if (fmt->type != V4L2_BUF_TYPE_VIDEO_CAPTURE)
 		return -EINVAL;
 
-	/*
-	 * Accept YUYV or NV12.  Anything else falls back to YUYV.
-	 */
+	/* Accept YUYV or NV12.  Anything else falls back to NV12. */
 	mutex_lock(&mixer->lock);
 	mixer->out_pixfmt = mixer_pixfmt_valid(fmt->fmt.pix.pixelformat) ?
 				    fmt->fmt.pix.pixelformat :
-				    V4L2_PIX_FMT_YUYV;
+				    V4L2_PIX_FMT_NV12;
 
 	if (fmt->fmt.pix.width > 0 && fmt->fmt.pix.height >= 2) {
 		mixer->out_width = fmt->fmt.pix.width;
@@ -2075,8 +2201,8 @@ static int mixer_vidioc_s_fmt(struct file *file, void *fh,
 		mixer->src_width = mixer->out_width;
 		mixer->src_height = mixer->out_height / 2;
 		pr_info("proxy_mixer: s_fmt accepted %ux%u fmt=0x%X (src %ux%u)\n",
-			mixer->out_width, mixer->out_height, mixer->out_pixfmt,
-			mixer->src_width, mixer->src_height);
+			    mixer->out_width, mixer->out_height, mixer->out_pixfmt,
+			    mixer->src_width, mixer->src_height);
 	}
 	mutex_unlock(&mixer->lock);
 
@@ -2086,7 +2212,7 @@ static int mixer_vidioc_s_fmt(struct file *file, void *fh,
 }
 
 static int mixer_vidioc_try_fmt(struct file *file, void *fh,
-				struct v4l2_format *fmt)
+			                	struct v4l2_format *fmt)
 {
 	struct proxy_mixer *mixer = video_drvdata(file);
 	u32 pixfmt;
@@ -2096,7 +2222,7 @@ static int mixer_vidioc_try_fmt(struct file *file, void *fh,
 
 	pixfmt = mixer_pixfmt_valid(fmt->fmt.pix.pixelformat) ?
 			 fmt->fmt.pix.pixelformat :
-			 V4L2_PIX_FMT_YUYV;
+			 V4L2_PIX_FMT_NV12;
 
 	fmt->fmt.pix.pixelformat = pixfmt;
 	fmt->fmt.pix.field = V4L2_FIELD_NONE;
@@ -2176,7 +2302,7 @@ static int mixer_vidioc_s_parm(struct file *file, void *fh,
 		mixer->fps_num = a->parm.capture.timeperframe.numerator;
 		mixer->fps_den = a->parm.capture.timeperframe.denominator;
 		pr_info("proxy_mixer: s_parm fps=%u/%u\n", mixer->fps_den,
-			mixer->fps_num);
+			    mixer->fps_num);
 	}
 	mutex_unlock(&mixer->lock);
 
@@ -2185,7 +2311,7 @@ static int mixer_vidioc_s_parm(struct file *file, void *fh,
 }
 
 static int mixer_vidioc_enum_framesizes(struct file *file, void *fh,
-					struct v4l2_frmsizeenum *fsize)
+			                    		struct v4l2_frmsizeenum *fsize)
 {
 	struct proxy_mixer *mixer = video_drvdata(file);
 	struct mixer_slot *src;
@@ -2202,14 +2328,13 @@ static int mixer_vidioc_enum_framesizes(struct file *file, void *fh,
 	}
 	src = &mixer->src[0];
 
-	ret = MIXER_CALL_OP(src, vidioc_enum_framesizes, src->filp, src->fh,
-			    fsize);
+	ret = MIXER_CALL_OP(src, vidioc_enum_framesizes, src->filp, src->fh, fsize);
 	mutex_unlock(&mixer->src_disc_lock);
 
 	if (ret)
 		return ret;
 
-	/*
+	/**
      * The UVC driver returns DISCRETE entries.  Double the height
      * to represent the stitched output.
      */
@@ -2226,7 +2351,7 @@ static int mixer_vidioc_enum_framesizes(struct file *file, void *fh,
 }
 
 static int mixer_vidioc_enum_frameintervals(struct file *file, void *fh,
-					    struct v4l2_frmivalenum *fival)
+					                        struct v4l2_frmivalenum *fival)
 {
 	struct proxy_mixer *mixer = video_drvdata(file);
 	struct mixer_slot *src;
@@ -2243,7 +2368,7 @@ static int mixer_vidioc_enum_frameintervals(struct file *file, void *fh,
 	}
 	src = &mixer->src[0];
 
-	/*
+	/**
      * OBS passes the mixer's output height (doubled).
      * Halve it to match the source camera's native resolution.
      */

@@ -13,10 +13,10 @@
 #   make clean           Remove build artefacts
 # ────────────────────────────────────────────────────────────────────────────
 
-MODULE_NAME := ej_video_stitch
+MODULE_NAME := uvc_stitch
 
 # --- Object list ------------------------------------------------------------
-$(MODULE_NAME)-y := ejcm3_mixer.o
+$(MODULE_NAME)-y := ejcm3_stitcher.o
 
 obj-$(CONFIG_VIDEO_PROXY_MIXER) += $(MODULE_NAME).o
 

@@ -22,21 +22,21 @@
 #include <media/videobuf2-v4l2.h>
 #include <media/videobuf2-vmalloc.h>
 
-#define STITCHER_NUM_SOURCES       2
-#define STITCHER_SRC_NUM_BUFS      4
-#define STITCHER_OUT_NUM_BUFS      4
-#define STITCHER_MAX_OUT_BUFS  	   8
+#define STITCHER_NUM_SOURCES 2
+#define STITCHER_SRC_NUM_BUFS 4
+#define STITCHER_OUT_NUM_BUFS 4
+#define STITCHER_MAX_OUT_BUFS 8
 #define STITCHER_SYNC_DRAIN_FRAMES 4
-#define STITCHER_SYNC_MAX_RETRIES  3
+#define STITCHER_SYNC_MAX_RETRIES 3
 
-#define STITCHER_DEFAULT_VID   0x1E4E
+#define STITCHER_DEFAULT_VID 0x1E4E
 #define STITCHER_DEFAULT_PID_P 0x7301
 #define STITCHER_DEFAULT_PID_S 0x7302
 
-#define STITCHER_DEFAULT_OUT_WIDTH  3840
+#define STITCHER_DEFAULT_OUT_WIDTH 3840
 #define STITCHER_DEFAULT_OUT_HEIGHT 2160
-#define STITCHER_DEFAULT_FPS_NUM    1
-#define STITCHER_DEFAULT_FPS_DEN    60
+#define STITCHER_DEFAULT_FPS_NUM 1
+#define STITCHER_DEFAULT_FPS_DEN 60
 
 /**
  * UVC_CALL_OP - call a UVC ioctl op directly, holding the vdev lock.
@@ -46,14 +46,16 @@
  * callers must ensure the source filp/vdev remain valid (protected by
  * src_disc_lock or uvc_ctrl_lock as appropriate).
  */
-#define UVC_CALL_OP(src, op, ...)                           \
-	({                                                        \
+#define UVC_CALL_OP(src, op, ...)                                     \
+	({                                                            \
 		int __ret = -ENOTTY;                                  \
 		struct video_device *__vd = (src)->vdev;              \
 		if (__vd && __vd->ioctl_ops && __vd->ioctl_ops->op) { \
-            if (__vd->lock) mutex_lock(__vd->lock);           \
-			__ret = __vd->ioctl_ops->op(__VA_ARGS__);         \
-            if (__vd->lock) mutex_unlock(__vd->lock);         \
+			if (__vd->lock)                               \
+				mutex_lock(__vd->lock);               \
+			__ret = __vd->ioctl_ops->op(__VA_ARGS__);     \
+			if (__vd->lock)                               \
+				mutex_unlock(__vd->lock);             \
 		}                                                     \
 		__ret;                                                \
 	})
@@ -100,7 +102,7 @@ struct stitcher_dmabuf_attach {
 struct stitcher_dmabuf_slot {
 	struct dma_buf *dbuf[STITCHER_NUM_SOURCES];
 	int cached_fd[STITCHER_NUM_SOURCES];
-	struct page **pages;/* vmalloc page array for this buffer */
+	struct page **pages; /* vmalloc page array for this buffer */
 	unsigned int num_pages;
 	bool created;
 };
@@ -167,7 +169,7 @@ struct uvc_stitcher {
 static int stitcher_uvc_start(struct uvc_stitcher *stitcher);
 static void stitcher_uvc_stop(struct uvc_stitcher *stitcher);
 static int stitcher_register_class_intf(struct uvc_stitcher *stitcher,
-				                     const struct class *vcls);
+					const struct class *vcls);
 static void stitcher_unregister_class_intf(struct uvc_stitcher *stitcher);
 static void stitcher_unregister(struct uvc_stitcher *stitcher);
 static int init_queue(struct stitcher_video_queue *q);
@@ -181,7 +183,8 @@ static struct uvc_stitcher *g_stitcher;
 /* ------------------------------------------------------------------ */
 static bool zerocopy = true;
 module_param(zerocopy, bool, 0444);
-MODULE_PARM_DESC(zerocopy, "Enable DMABUF feed-through zero-copy (default: true)");
+MODULE_PARM_DESC(zerocopy,
+		 "Enable DMABUF feed-through zero-copy (default: true)");
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Syu-Song Chiang");
@@ -193,17 +196,17 @@ MODULE_IMPORT_NS("DMA_BUF");
 /* ------------------------------------------------------------------ */
 static inline bool stitcher_src_valid(const struct stitcher_slot *src)
 {
-    return !IS_ERR_OR_NULL(src->filp) && src->vdev;
+	return !IS_ERR_OR_NULL(src->filp) && src->vdev;
 }
 
 static inline bool stitcher_should_stop(const struct uvc_stitcher *stitcher)
 {
-    return kthread_should_stop() || !atomic_read(&stitcher->streaming);
+	return kthread_should_stop() || !atomic_read(&stitcher->streaming);
 }
 
 static inline bool stitcher_is_fatal_err(int err)
 {
-    return err == -ENODEV || err == -EIO;
+	return err == -ENODEV || err == -EIO;
 }
 
 /* ------------------------------------------------------------------ */
@@ -242,7 +245,7 @@ static inline bool stitcher_pixfmt_valid(u32 pixfmt)
 /* dma_buf exporter ops                                               */
 /* ------------------------------------------------------------------ */
 static int stitcher_dmabuf_attach(struct dma_buf *dbuf,
-			                   struct dma_buf_attachment *attach)
+				  struct dma_buf_attachment *attach)
 {
 	struct stitcher_dmabuf_attach *a;
 
@@ -255,7 +258,7 @@ static int stitcher_dmabuf_attach(struct dma_buf *dbuf,
 }
 
 static void stitcher_dmabuf_detach(struct dma_buf *dbuf,
-				                struct dma_buf_attachment *attach)
+				   struct dma_buf_attachment *attach)
 {
 	struct stitcher_dmabuf_attach *a = attach->priv;
 
@@ -285,7 +288,7 @@ static void stitcher_dmabuf_detach(struct dma_buf *dbuf,
  * cached DMA addresses remain valid across frames.
  */
 static struct sg_table *stitcher_dmabuf_map(struct dma_buf_attachment *attach,
-					                     enum dma_data_direction dir)
+					    enum dma_data_direction dir)
 {
 	struct stitcher_dmabuf_attach *a = attach->priv;
 	struct stitcher_dmabuf_priv *priv = attach->dmabuf->priv;
@@ -330,8 +333,8 @@ static struct sg_table *stitcher_dmabuf_map(struct dma_buf_attachment *attach,
  * static (pinned) backing pages.
  */
 static void stitcher_dmabuf_unmap(struct dma_buf_attachment *attach,
-			                   struct sg_table *sgt,
-			                   enum dma_data_direction dir)
+				  struct sg_table *sgt,
+				  enum dma_data_direction dir)
 {
 	/* Cached — freed on detach, not here */
 }
@@ -347,14 +350,14 @@ static void stitcher_dmabuf_unpin(struct dma_buf_attachment *attach)
 }
 
 static int stitcher_dmabuf_begin_cpu_access(struct dma_buf *dbuf,
-				                    	 enum dma_data_direction dir)
+					    enum dma_data_direction dir)
 {
 	/* x86: cache-coherent, no action needed */
 	return 0;
 }
 
 static int stitcher_dmabuf_end_cpu_access(struct dma_buf *dbuf,
-				                       enum dma_data_direction dir)
+					  enum dma_data_direction dir)
 {
 	return 0;
 }
@@ -379,7 +382,7 @@ static int stitcher_dmabuf_vmap(struct dma_buf *dbuf, struct iosys_map *map)
 
 static void stitcher_dmabuf_vunmap(struct dma_buf *dbuf, struct iosys_map *map)
 {
-    struct stitcher_dmabuf_priv *priv;
+	struct stitcher_dmabuf_priv *priv;
 	void *va = map->vaddr;
 
 	if (va) {
@@ -389,7 +392,7 @@ static void stitcher_dmabuf_vunmap(struct dma_buf *dbuf, struct iosys_map *map)
 }
 
 static const struct dma_buf_ops stitcher_dmabuf_ops = {
-    // clang-format off
+	// clang-format off
 	.attach           = stitcher_dmabuf_attach,
 	.detach           = stitcher_dmabuf_detach,
 	.pin              = stitcher_dmabuf_pin,
@@ -401,7 +404,7 @@ static const struct dma_buf_ops stitcher_dmabuf_ops = {
 	.release          = stitcher_dmabuf_release,
 	.vmap             = stitcher_dmabuf_vmap,
 	.vunmap           = stitcher_dmabuf_vunmap,
-    // clang-format on
+	// clang-format on
 };
 
 /* ------------------------------------------------------------------ */
@@ -419,8 +422,8 @@ static const struct dma_buf_ops stitcher_dmabuf_ops = {
  * Pages must outlive the dma_buf (guaranteed: output buffer freed after dma_buf).
  */
 static struct dma_buf *stitcher_create_dmabuf(struct page **pages,
-					                       unsigned int num_pages,
-					                       unsigned int offset, size_t size)
+					      unsigned int num_pages,
+					      unsigned int offset, size_t size)
 {
 	struct stitcher_dmabuf_priv *priv;
 	struct dma_buf *dbuf;
@@ -448,8 +451,7 @@ static struct dma_buf *stitcher_create_dmabuf(struct page **pages,
 }
 
 static int stitcher_dqbuf_src_dmabuf(struct uvc_stitcher *stitcher, int slot,
-                                  unsigned int *out_index,
-                                  u32 *out_sequence)
+				     unsigned int *out_index, u32 *out_sequence)
 {
 	struct stitcher_slot *src = &stitcher->src[slot];
 	struct v4l2_buffer buf = {
@@ -460,7 +462,7 @@ static int stitcher_dqbuf_src_dmabuf(struct uvc_stitcher *stitcher, int slot,
 
 	if (!stitcher_src_valid(src)) {
 		pr_info("uvc_stitcher: src%d dqbuf skipped (invalid state)\n",
-			    slot);
+			slot);
 		return -ENODEV;
 	}
 
@@ -485,7 +487,7 @@ static int stitcher_dqbuf_src_dmabuf(struct uvc_stitcher *stitcher, int slot,
  *      Can be a temporary fd (initial QBUF) or cached fd (re-QBUF).
  */
 static int stitcher_qbuf_src_dmabuf(struct uvc_stitcher *stitcher, int slot,
-				                 unsigned int buf_index, int fd)
+				    unsigned int buf_index, int fd)
 {
 	struct stitcher_slot *src = &stitcher->src[slot];
 	struct v4l2_buffer v4l2_buf = {
@@ -514,9 +516,9 @@ static int stitcher_qbuf_src_dmabuf(struct uvc_stitcher *stitcher, int slot,
  * Creates a temporary fd in current->files, calls QBUF, closes fd.
  * Used for initial pre-QBUF in ioctl context.
  */
-static int stitcher_dmabuf_qbuf_with_tmpfd(struct uvc_stitcher *stitcher, int slot,
-					                    unsigned int buf_index,
-				                    	struct dma_buf *dbuf)
+static int stitcher_dmabuf_qbuf_with_tmpfd(struct uvc_stitcher *stitcher,
+					   int slot, unsigned int buf_index,
+					   struct dma_buf *dbuf)
 {
 	int fd, ret;
 
@@ -541,7 +543,7 @@ static int stitcher_dmabuf_qbuf_with_tmpfd(struct uvc_stitcher *stitcher, int sl
  */
 static int stitcher_dmabuf_create_cached_fds(struct uvc_stitcher *stitcher)
 {
-    struct stitcher_dmabuf_slot *ds;
+	struct stitcher_dmabuf_slot *ds;
 	unsigned int i;
 	int s, fd;
 
@@ -554,7 +556,8 @@ static int stitcher_dmabuf_create_cached_fds(struct uvc_stitcher *stitcher)
 
 			fd = get_unused_fd_flags(O_CLOEXEC);
 			if (fd < 0) {
-				pr_err("uvc_stitcher: get_unused_fd failed: %d\n", fd);
+				pr_err("uvc_stitcher: get_unused_fd failed: %d\n",
+				       fd);
 				return fd;
 			}
 
@@ -562,8 +565,9 @@ static int stitcher_dmabuf_create_cached_fds(struct uvc_stitcher *stitcher)
 			fd_install(fd, ds->dbuf[s]->file);
 			ds->cached_fd[s] = fd;
 
-			pr_debug("uvc_stitcher: cached fd %d for slot%u src%d\n",
-				     fd, i, s);
+			pr_debug(
+				"uvc_stitcher: cached fd %d for slot%u src%d\n",
+				fd, i, s);
 		}
 	}
 	return 0;
@@ -577,7 +581,7 @@ static int stitcher_dmabuf_create_cached_fds(struct uvc_stitcher *stitcher)
  */
 static void stitcher_dmabuf_close_cached_fds(struct uvc_stitcher *stitcher)
 {
-    struct stitcher_dmabuf_slot *ds;
+	struct stitcher_dmabuf_slot *ds;
 	unsigned int i, s;
 
 	for (i = 0; i < stitcher->num_dmabuf_slots; i++) {
@@ -599,9 +603,9 @@ static void stitcher_dmabuf_close_cached_fds(struct uvc_stitcher *stitcher)
  * sg_alloc_table_from_pages with offset handles non-page-aligned splits.
  */
 static int stitcher_dmabuf_setup_slot(struct uvc_stitcher *stitcher,
-                                   struct stitcher_dmabuf_slot *ds,
-                                   struct vb2_buffer *out_vb,
-                                   unsigned int half_size)
+				      struct stitcher_dmabuf_slot *ds,
+				      struct vb2_buffer *out_vb,
+				      unsigned int half_size)
 {
 	void *va;
 	unsigned int frame_size = half_size * 2;
@@ -627,7 +631,8 @@ static int stitcher_dmabuf_setup_slot(struct uvc_stitcher *stitcher,
 	for (i = 0; i < total_pages; i++) {
 		ds->pages[i] = vmalloc_to_page((u8 *)va + (u64)i * PAGE_SIZE);
 		if (!ds->pages[i]) {
-			pr_err("uvc_stitcher: vmalloc_to_page NULL at page %u\n", i);
+			pr_err("uvc_stitcher: vmalloc_to_page NULL at page %u\n",
+			       i);
 			ret = -EFAULT;
 			goto err_pages;
 		}
@@ -653,7 +658,8 @@ static int stitcher_dmabuf_setup_slot(struct uvc_stitcher *stitcher,
 			b_offset, L1_CACHE_BYTES);
 
 	/* dma_buf for src0 (first half) */
-	ds->dbuf[0] = stitcher_create_dmabuf(ds->pages, a_num_pages, 0, half_size);
+	ds->dbuf[0] =
+		stitcher_create_dmabuf(ds->pages, a_num_pages, 0, half_size);
 	if (IS_ERR(ds->dbuf[0])) {
 		ret = PTR_ERR(ds->dbuf[0]);
 		ds->dbuf[0] = NULL;
@@ -661,8 +667,9 @@ static int stitcher_dmabuf_setup_slot(struct uvc_stitcher *stitcher,
 	}
 
 	/* dma_buf for src1 (second half) */
-	ds->dbuf[1] = stitcher_create_dmabuf(&ds->pages[b_first_page], b_num_pages,
-					                  b_offset, frame_size - half_size);
+	ds->dbuf[1] = stitcher_create_dmabuf(&ds->pages[b_first_page],
+					     b_num_pages, b_offset,
+					     frame_size - half_size);
 	if (IS_ERR(ds->dbuf[1])) {
 		ret = PTR_ERR(ds->dbuf[1]);
 		ds->dbuf[1] = NULL;
@@ -676,9 +683,9 @@ static int stitcher_dmabuf_setup_slot(struct uvc_stitcher *stitcher,
 		ds->cached_fd[i] = -1;
 
 	pr_debug("uvc_stitcher: dmabuf slot buf%d: A=%u pages off=0 len=%u, "
-		     "B=%u pages off=%u len=%u\n",
-		     out_vb->index, a_num_pages, half_size,
-		     b_num_pages, b_offset, frame_size - half_size);
+		 "B=%u pages off=%u len=%u\n",
+		 out_vb->index, a_num_pages, half_size, b_num_pages, b_offset,
+		 frame_size - half_size);
 
 	return 0;
 
@@ -724,17 +731,19 @@ static void stitcher_dmabuf_teardown_all(struct uvc_stitcher *stitcher)
  */
 static bool stitcher_dmabuf_check_support(struct uvc_stitcher *stitcher)
 {
-    struct vb2_queue *vbq;
+	struct vb2_queue *vbq;
 	int i;
 
 	for (i = 0; i < STITCHER_NUM_SOURCES; i++) {
-        vbq = stitcher->src[i].vbq;
+		vbq = stitcher->src[i].vbq;
 		if (!vbq) {
-			pr_info("uvc_stitcher: src%d vbq NULL, DMABUF not available\n", i);
+			pr_info("uvc_stitcher: src%d vbq NULL, DMABUF not available\n",
+				i);
 			return false;
 		}
 		if (!(vbq->io_modes & VB2_DMABUF)) {
-			pr_info("uvc_stitcher: src%d lacks VB2_DMABUF, falling back to memcpy\n", i);
+			pr_info("uvc_stitcher: src%d lacks VB2_DMABUF, falling back to memcpy\n",
+				i);
 			return false;
 		}
 	}
@@ -810,7 +819,7 @@ static void stitcher_disc_work_fn(struct work_struct *w)
 		container_of(w, struct stitcher_disc_work, work);
 	struct uvc_stitcher *stitcher = dw->stitcher;
 	struct video_device *vdev = dw->vdev;
-    struct device *intf_dev;
+	struct device *intf_dev;
 	struct usb_interface *intf;
 	struct usb_device *udev;
 	u16 pid;
@@ -820,10 +829,10 @@ static void stitcher_disc_work_fn(struct work_struct *w)
 	int i;
 
 	if (dw->is_add) {
-        intf_dev = vdev->v4l2_dev->dev;
-        intf = to_usb_interface(intf_dev);
-	    udev = interface_to_usbdev(intf);
-        pid = le16_to_cpu(udev->descriptor.idProduct);
+		intf_dev = vdev->v4l2_dev->dev;
+		intf = to_usb_interface(intf_dev);
+		udev = interface_to_usbdev(intf);
+		pid = le16_to_cpu(udev->descriptor.idProduct);
 
 		mutex_lock(&stitcher->src_disc_lock);
 		if (stitcher->src_ready_count >= STITCHER_NUM_SOURCES) {
@@ -831,13 +840,13 @@ static void stitcher_disc_work_fn(struct work_struct *w)
 			goto out;
 		}
 
-        if (pid == STITCHER_DEFAULT_PID_P) {
-            if (!stitcher->src[0].filp)
+		if (pid == STITCHER_DEFAULT_PID_P) {
+			if (!stitcher->src[0].filp)
 				slot = 0;
-        } else if (pid == STITCHER_DEFAULT_PID_S) {
-            if (!stitcher->src[1].filp)
+		} else if (pid == STITCHER_DEFAULT_PID_S) {
+			if (!stitcher->src[1].filp)
 				slot = 1;
-        }
+		}
 
 		if (slot < 0) {
 			mutex_unlock(&stitcher->src_disc_lock);
@@ -853,8 +862,8 @@ static void stitcher_disc_work_fn(struct work_struct *w)
 		snprintf(devpath, sizeof(devpath), "/dev/video%d", vdev->num);
 		filp = filp_open(devpath, O_RDWR, 0);
 		if (IS_ERR(filp)) {
-			pr_err("uvc_stitcher: filp_open(%s): %ld\n",
-                   devpath, PTR_ERR(filp));
+			pr_err("uvc_stitcher: filp_open(%s): %ld\n", devpath,
+			       PTR_ERR(filp));
 			mutex_lock(&stitcher->src_disc_lock);
 			stitcher->src[slot].filp = NULL;
 			stitcher->src_ready_count--;
@@ -866,7 +875,8 @@ static void stitcher_disc_work_fn(struct work_struct *w)
 		stitcher->src[slot].filp = filp;
 		stitcher->src[slot].vdev = video_devdata(filp);
 		stitcher->src[slot].fh = filp->private_data;
-		stitcher->src[slot].vbq = stitcher_get_uvc_vbq(&stitcher->src[slot]);
+		stitcher->src[slot].vbq =
+			stitcher_get_uvc_vbq(&stitcher->src[slot]);
 		if (!stitcher->src[slot].vbq) {
 			pr_err("uvc_stitcher: slot%d: cannot locate vb2_queue\n",
 			       slot);
@@ -881,8 +891,9 @@ static void stitcher_disc_work_fn(struct work_struct *w)
 		stitcher->src[slot].udev = interface_to_usbdev(
 			to_usb_interface(vdev->v4l2_dev->dev));
 
-		pr_info("uvc_stitcher: slot%d filled (%s), ready=%d/%d\n",
-                slot, devpath, stitcher->src_ready_count, STITCHER_NUM_SOURCES);
+		pr_info("uvc_stitcher: slot%d filled (%s), ready=%d/%d\n", slot,
+			devpath, stitcher->src_ready_count,
+			STITCHER_NUM_SOURCES);
 		mutex_unlock(&stitcher->src_disc_lock);
 	} else {
 		if (atomic_read(&stitcher->streaming))
@@ -941,14 +952,14 @@ static bool stitcher_match_device(struct video_device *vdev)
 
 	if (le16_to_cpu(udev->descriptor.idVendor) != STITCHER_DEFAULT_VID) {
 		pr_info("uvc_stitcher: ignoring USB device with VID=0x%04X\n",
-			    le16_to_cpu(udev->descriptor.idVendor));
+			le16_to_cpu(udev->descriptor.idVendor));
 		return false;
 	}
 
 	pid = le16_to_cpu(udev->descriptor.idProduct);
 	if (pid != STITCHER_DEFAULT_PID_P && pid != STITCHER_DEFAULT_PID_S) {
 		pr_info("uvc_stitcher: ignoring USB device with PID=0x%04X\n",
-			    pid);
+			pid);
 		return false;
 	}
 
@@ -956,22 +967,22 @@ static bool stitcher_match_device(struct video_device *vdev)
 }
 
 static int stitcher_schedule_disc_work(struct uvc_stitcher *stitcher,
-                                    struct video_device *vdev, bool is_add)
+				       struct video_device *vdev, bool is_add)
 {
-    struct stitcher_disc_work *dw;
+	struct stitcher_disc_work *dw;
 
-    dw = kzalloc(sizeof(*dw), GFP_ATOMIC);
-    if (!dw)
-        return -ENOMEM;
+	dw = kzalloc(sizeof(*dw), GFP_ATOMIC);
+	if (!dw)
+		return -ENOMEM;
 
-    get_device(&vdev->dev);
-    INIT_WORK(&dw->work, stitcher_disc_work_fn);
-    dw->stitcher = stitcher;
-    dw->vdev = vdev;
-    dw->is_add = is_add;
+	get_device(&vdev->dev);
+	INIT_WORK(&dw->work, stitcher_disc_work_fn);
+	dw->stitcher = stitcher;
+	dw->vdev = vdev;
+	dw->is_add = is_add;
 
-    queue_work(stitcher->disc_wq, &dw->work);
-    return 0;
+	queue_work(stitcher->disc_wq, &dw->work);
+	return 0;
 }
 
 static int stitcher_class_add_dev(struct device *dev)
@@ -1014,7 +1025,7 @@ static void stitcher_class_remove_dev(struct device *dev)
 }
 
 static int stitcher_register_class_intf(struct uvc_stitcher *stitcher,
-				     const struct class *vcls)
+					const struct class *vcls)
 {
 	stitcher->class_intf.class = vcls;
 	stitcher->class_intf.add_dev = stitcher_class_add_dev;
@@ -1046,7 +1057,8 @@ static int stitcher_uvc_check_slots(struct uvc_stitcher *stitcher)
 	return 0;
 }
 
-static int stitcher_uvc_negotiate_src_fmt(struct uvc_stitcher *stitcher, int slot)
+static int stitcher_uvc_negotiate_src_fmt(struct uvc_stitcher *stitcher,
+					  int slot)
 {
 	struct stitcher_slot *src = &stitcher->src[slot];
 	int ret;
@@ -1057,23 +1069,25 @@ static int stitcher_uvc_negotiate_src_fmt(struct uvc_stitcher *stitcher, int slo
 	src->fmt.fmt.pix.pixelformat = stitcher->out_pixfmt;
 	src->fmt.fmt.pix.field = V4L2_FIELD_NONE;
 
-	ret = UVC_CALL_OP(src, vidioc_s_fmt_vid_cap, src->filp, src->fh, &src->fmt);
+	ret = UVC_CALL_OP(src, vidioc_s_fmt_vid_cap, src->filp, src->fh,
+			  &src->fmt);
 	if (ret) {
 		pr_err("uvc_stitcher: vidioc_s_fmt_vid_cap failed for slot%d: %d\n",
 		       slot, ret);
 		return ret;
 	}
 
-	ret = UVC_CALL_OP(src, vidioc_g_fmt_vid_cap, src->filp, src->fh, &src->fmt);
+	ret = UVC_CALL_OP(src, vidioc_g_fmt_vid_cap, src->filp, src->fh,
+			  &src->fmt);
 	if (ret) {
 		pr_err("uvc_stitcher: vidioc_g_fmt_vid_cap failed for slot%d: %d\n",
 		       slot, ret);
 		return ret;
 	}
 
-	pr_info("uvc_stitcher: src%d format negotiated: %ux%u, fmt=0x%X\n", slot,
-		    src->fmt.fmt.pix.width, src->fmt.fmt.pix.height,
-		    src->fmt.fmt.pix.pixelformat);
+	pr_info("uvc_stitcher: src%d format negotiated: %ux%u, fmt=0x%X\n",
+		slot, src->fmt.fmt.pix.width, src->fmt.fmt.pix.height,
+		src->fmt.fmt.pix.pixelformat);
 
 	return 0;
 }
@@ -1084,7 +1098,8 @@ static int stitcher_uvc_negotiate_src_fmt(struct uvc_stitcher *stitcher, int slo
  * Called after s_fmt so the UVC driver knows the active resolution.
  * Uses stitcher->fps_num / fps_den chosen by userspace via s_parm.
  */
-static int stitcher_uvc_negotiate_src_fps(struct uvc_stitcher *stitcher, int slot)
+static int stitcher_uvc_negotiate_src_fps(struct uvc_stitcher *stitcher,
+					  int slot)
 {
 	struct stitcher_slot *src = &stitcher->src[slot];
 	struct v4l2_streamparm parm = {
@@ -1098,17 +1113,18 @@ static int stitcher_uvc_negotiate_src_fps(struct uvc_stitcher *stitcher, int slo
 	ret = UVC_CALL_OP(src, vidioc_s_parm, src->filp, src->fh, &parm);
 	if (ret) {
 		pr_info("uvc_stitcher: src%d s_parm failed: %d (non-fatal)\n",
-			    slot, ret);
+			slot, ret);
 		return 0;
 	}
 
 	pr_info("uvc_stitcher: src%d fps negotiated: %u/%u\n", slot,
-		    parm.parm.capture.timeperframe.denominator,
-		    parm.parm.capture.timeperframe.numerator);
+		parm.parm.capture.timeperframe.denominator,
+		parm.parm.capture.timeperframe.numerator);
 	return 0;
 }
 
-static int stitcher_uvc_reqbufs_mmap(struct uvc_stitcher *stitcher, int idx, unsigned int count)
+static int stitcher_uvc_reqbufs_mmap(struct uvc_stitcher *stitcher, int idx,
+				     unsigned int count)
 {
 	struct stitcher_slot *src = &stitcher->src[idx];
 	struct v4l2_requestbuffers req = {
@@ -1149,7 +1165,7 @@ static int stitcher_uvc_reqbufs_mmap(struct uvc_stitcher *stitcher, int idx, uns
 
 /* REQBUFS for DMABUF mode (buffer slots only, no physical memory) */
 static int stitcher_uvc_reqbufs_dmabuf(struct uvc_stitcher *stitcher, int idx,
-				    unsigned int count)
+				       unsigned int count)
 {
 	struct stitcher_slot *src = &stitcher->src[idx];
 	struct v4l2_requestbuffers req = {
@@ -1163,8 +1179,8 @@ static int stitcher_uvc_reqbufs_dmabuf(struct uvc_stitcher *stitcher, int idx,
 	if (ret)
 		return ret;
 	if (req.count < count) {
-		pr_warn("uvc_stitcher: src%d REQBUFS(DMABUF) got %u/%u\n",
-			idx, req.count, count);
+		pr_warn("uvc_stitcher: src%d REQBUFS(DMABUF) got %u/%u\n", idx,
+			req.count, count);
 		if (req.count < 2)
 			return -ENOMEM;
 	}
@@ -1173,44 +1189,45 @@ static int stitcher_uvc_reqbufs_dmabuf(struct uvc_stitcher *stitcher, int idx,
 
 static int stitcher_uvc_start_pre_queue(struct uvc_stitcher *stitcher)
 {
-    unsigned long flags;
-    struct stitcher_video_buffer *mbuf;
-    unsigned int i, j;
-    int ret;
-    unsigned int prequeued = 0;
+	unsigned long flags;
+	struct stitcher_video_buffer *mbuf;
+	unsigned int i, j;
+	int ret;
+	unsigned int prequeued = 0;
 
-    spin_lock_irqsave(&stitcher->out_q.irqlock, flags);
-    while (!list_empty(&stitcher->out_q.irqqueue)) {
-        mbuf = list_first_entry(&stitcher->out_q.irqqueue,
-                                struct stitcher_video_buffer, queue);
-        list_del(&mbuf->queue);
-        spin_unlock_irqrestore(&stitcher->out_q.irqlock, flags);
+	spin_lock_irqsave(&stitcher->out_q.irqlock, flags);
+	while (!list_empty(&stitcher->out_q.irqqueue)) {
+		mbuf = list_first_entry(&stitcher->out_q.irqqueue,
+					struct stitcher_video_buffer, queue);
+		list_del(&mbuf->queue);
+		spin_unlock_irqrestore(&stitcher->out_q.irqlock, flags);
 
-        i = mbuf->buf.vb2_buf.index;
-        for (j = 0; j < STITCHER_NUM_SOURCES; j++) {
-            ret = stitcher_dmabuf_qbuf_with_tmpfd(stitcher, j, i,
-                                               stitcher->dma_slots[i].dbuf[j]);
-            if (ret)
-                return ret;
-        }
-        prequeued++;
+		i = mbuf->buf.vb2_buf.index;
+		for (j = 0; j < STITCHER_NUM_SOURCES; j++) {
+			ret = stitcher_dmabuf_qbuf_with_tmpfd(
+				stitcher, j, i, stitcher->dma_slots[i].dbuf[j]);
+			if (ret)
+				return ret;
+		}
+		prequeued++;
 
-        spin_lock_irqsave(&stitcher->out_q.irqlock, flags);
-    }
-    spin_unlock_irqrestore(&stitcher->out_q.irqlock, flags);
+		spin_lock_irqsave(&stitcher->out_q.irqlock, flags);
+	}
+	spin_unlock_irqrestore(&stitcher->out_q.irqlock, flags);
 
-    atomic_set(&stitcher->bufs_in_flight, prequeued);
-    pr_info("uvc_stitcher: pre-queued %u buffers to UVC sources\n",
-            prequeued);
+	atomic_set(&stitcher->bufs_in_flight, prequeued);
+	pr_info("uvc_stitcher: pre-queued %u buffers to UVC sources\n",
+		prequeued);
 
-    return 0;
+	return 0;
 }
 
 static int stitcher_uvc_streamon(struct uvc_stitcher *stitcher, int idx)
 {
 	enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
 	int ret = UVC_CALL_OP(&stitcher->src[idx], vidioc_streamon,
-				stitcher->src[idx].filp, stitcher->src[idx].fh, type);
+			      stitcher->src[idx].filp, stitcher->src[idx].fh,
+			      type);
 	if (ret)
 		pr_err("uvc_stitcher: src%d STREAMON failed: %d\n", idx, ret);
 	return ret;
@@ -1269,34 +1286,39 @@ static int stitcher_uvc_start(struct uvc_stitcher *stitcher)
 		}
 	}
 
-    /* Negotiate format and framerate */
+	/* Negotiate format and framerate */
 	for (i = 0; i < STITCHER_NUM_SOURCES; i++) {
 		ret = stitcher_uvc_negotiate_src_fmt(stitcher, i);
 		if (ret) {
-			pr_err("uvc_stitcher: failed to negotiate format for src%d\n", i);
+			pr_err("uvc_stitcher: failed to negotiate format for src%d\n",
+			       i);
 			goto err_out;
 		}
 		stitcher_uvc_negotiate_src_fps(stitcher, i);
 	}
 
-    /* Determine DMABUF mode at runtime */
-	stitcher->use_dmabuf = zerocopy && stitcher_dmabuf_check_support(stitcher);
+	/* Determine DMABUF mode at runtime */
+	stitcher->use_dmabuf = zerocopy &&
+			       stitcher_dmabuf_check_support(stitcher);
 
 	/* Count queued output buffers */
 	out_count = vb2_get_num_buffers(&stitcher->out_q.vbq);
 	if (out_count > STITCHER_MAX_OUT_BUFS)
 		out_count = STITCHER_MAX_OUT_BUFS;
 
-	half_size = stitcher_image_size(stitcher->out_width, stitcher->out_height,
-				                 stitcher->out_pixfmt) / 2;
+	half_size = stitcher_image_size(stitcher->out_width,
+					stitcher->out_height,
+					stitcher->out_pixfmt) /
+		    2;
 
 	if (stitcher->use_dmabuf) {
 		pr_info("uvc_stitcher: using DMABUF feed-through (out_bufs=%u half=%u)\n",
-                out_count, half_size);
+			out_count, half_size);
 
 		/* REQBUFS(DMABUF) for each UVC source */
 		for (i = 0; i < STITCHER_NUM_SOURCES; i++) {
-			ret = stitcher_uvc_reqbufs_dmabuf(stitcher, i, out_count);
+			ret = stitcher_uvc_reqbufs_dmabuf(stitcher, i,
+							  out_count);
 			if (ret)
 				goto err_out;
 		}
@@ -1304,32 +1326,34 @@ static int stitcher_uvc_start(struct uvc_stitcher *stitcher)
 		/* Create dma_bufs for all output buffers */
 		stitcher->num_dmabuf_slots = out_count;
 		for (i = 0; i < out_count; i++) {
-			struct vb2_buffer *vb = vb2_get_buffer(&stitcher->out_q.vbq, i);
+			struct vb2_buffer *vb =
+				vb2_get_buffer(&stitcher->out_q.vbq, i);
 			if (!vb) {
 				ret = -EINVAL;
 				goto err_dmabuf;
 			}
 			stitcher->out_vb_map[i] = vb;
 
-			ret = stitcher_dmabuf_setup_slot(stitcher, &stitcher->dma_slots[i],
-						                  vb, half_size);
+			ret = stitcher_dmabuf_setup_slot(
+				stitcher, &stitcher->dma_slots[i], vb,
+				half_size);
 			if (ret)
 				goto err_dmabuf;
 		}
 
-        /*
+		/*
 		 * Pre-queue all output buffers to UVC sources.
 		 * Take them from irqqueue (queued by userspace) and submit.
 		 */
-        ret = stitcher_uvc_start_pre_queue(stitcher);
-        if (ret)
-            goto err_dmabuf;		
+		ret = stitcher_uvc_start_pre_queue(stitcher);
+		if (ret)
+			goto err_dmabuf;
 	} else {
 		pr_info("uvc_stitcher: using memcpy fallback\n");
 
 		for (i = 0; i < STITCHER_NUM_SOURCES; i++) {
 			ret = stitcher_uvc_reqbufs_mmap(stitcher, i,
-						                 STITCHER_OUT_NUM_BUFS);
+							STITCHER_OUT_NUM_BUFS);
 			if (ret)
 				goto err_out;
 		}
@@ -1346,7 +1370,8 @@ static int stitcher_uvc_start(struct uvc_stitcher *stitcher)
 
 	/* Start kthread */
 	atomic_set(&stitcher->streaming, 1);
-	stitcher->stitcher_task = kthread_run(stitcher_thread_fn, stitcher, "uvc_stitcher");
+	stitcher->stitcher_task =
+		kthread_run(stitcher_thread_fn, stitcher, "uvc_stitcher");
 	if (IS_ERR(stitcher->stitcher_task)) {
 		ret = PTR_ERR(stitcher->stitcher_task);
 		stitcher->stitcher_task = NULL;
@@ -1466,7 +1491,7 @@ static void stitcher_qbuf_src_mmap(struct uvc_stitcher *stitcher, int slot)
 
 /* Memcpy */
 static void stitcher_stitch_memcpy(u8 *dst, const u8 *src0, const u8 *src1,
-                                u64 raw_size)
+				   u64 raw_size)
 {
 	memcpy(dst, src0, raw_size);
 	memcpy(dst + raw_size, src1, raw_size);
@@ -1478,12 +1503,12 @@ static void stitcher_stitch_memcpy(u8 *dst, const u8 *src0, const u8 *src1,
  * Used when a DQBUF pair must be discarded (index or sequence mismatch).
  */
 static void stitcher_requeue_pair_dmabuf(struct uvc_stitcher *stitcher,
-                                      unsigned int idx0, unsigned int idx1)
+					 unsigned int idx0, unsigned int idx1)
 {
-    stitcher_qbuf_src_dmabuf(stitcher, 0, idx0,
-                          stitcher->dma_slots[idx0].cached_fd[0]);
-    stitcher_qbuf_src_dmabuf(stitcher, 1, idx1,
-                          stitcher->dma_slots[idx1].cached_fd[1]);
+	stitcher_qbuf_src_dmabuf(stitcher, 0, idx0,
+				 stitcher->dma_slots[idx0].cached_fd[0]);
+	stitcher_qbuf_src_dmabuf(stitcher, 1, idx1,
+				 stitcher->dma_slots[idx1].cached_fd[1]);
 }
 
 /**
@@ -1493,13 +1518,13 @@ static void stitcher_requeue_pair_dmabuf(struct uvc_stitcher *stitcher,
  * kthread can retry it on the next iteration.
  */
 static void stitcher_requeue_outbuf(struct stitcher_video_queue *q,
-                                 struct stitcher_video_buffer *mbuf)
+				    struct stitcher_video_buffer *mbuf)
 {
-    unsigned long flags;
+	unsigned long flags;
 
-    spin_lock_irqsave(&q->irqlock, flags);
-    list_add_tail(&mbuf->queue, &q->irqqueue);
-    spin_unlock_irqrestore(&q->irqlock, flags);
+	spin_lock_irqsave(&q->irqlock, flags);
+	list_add_tail(&mbuf->queue, &q->irqqueue);
+	spin_unlock_irqrestore(&q->irqlock, flags);
 }
 
 /**
@@ -1513,36 +1538,37 @@ static void stitcher_requeue_outbuf(struct stitcher_video_queue *q,
  */
 static int stitcher_dmabuf_resync_sources(struct uvc_stitcher *stitcher)
 {
-    unsigned int i, s;
-    int ret;
+	unsigned int i, s;
+	int ret;
 
-    /* STREAMOFF both — stops URBs, resets UVC state */
-    for (s = 0; s < STITCHER_NUM_SOURCES; s++)
-        stitcher_uvc_streamoff_only(stitcher, s);
+	/* STREAMOFF both — stops URBs, resets UVC state */
+	for (s = 0; s < STITCHER_NUM_SOURCES; s++)
+		stitcher_uvc_streamoff_only(stitcher, s);
 
-    /* Re-QBUF all output buffers to both sources */
-    for (i = 0; i < stitcher->num_dmabuf_slots; i++) {
-        for (s = 0; s < STITCHER_NUM_SOURCES; s++) {
-            ret = stitcher_qbuf_src_dmabuf(stitcher, s, i,
-                    stitcher->dma_slots[i].cached_fd[s]);
-            if (ret) {
-                pr_err("uvc_stitcher: resync re-QBUF "
-                       "slot %u src%u failed: %d\n",
-                       i, s, ret);
-                return ret;
-            }
-        }
-    }
+	/* Re-QBUF all output buffers to both sources */
+	for (i = 0; i < stitcher->num_dmabuf_slots; i++) {
+		for (s = 0; s < STITCHER_NUM_SOURCES; s++) {
+			ret = stitcher_qbuf_src_dmabuf(
+				stitcher, s, i,
+				stitcher->dma_slots[i].cached_fd[s]);
+			if (ret) {
+				pr_err("uvc_stitcher: resync re-QBUF "
+				       "slot %u src%u failed: %d\n",
+				       i, s, ret);
+				return ret;
+			}
+		}
+	}
 
-    /* STREAMON both — UVC resets sequence counter, submits URBs */
-    for (s = 0; s < STITCHER_NUM_SOURCES; s++) {
-        ret = stitcher_uvc_streamon(stitcher, s);
-        if (ret)
-            return ret;
-    }
+	/* STREAMON both — UVC resets sequence counter, submits URBs */
+	for (s = 0; s < STITCHER_NUM_SOURCES; s++) {
+		ret = stitcher_uvc_streamon(stitcher, s);
+		if (ret)
+			return ret;
+	}
 
-    atomic_set(&stitcher->bufs_in_flight, stitcher->num_dmabuf_slots);
-    return 0;
+	atomic_set(&stitcher->bufs_in_flight, stitcher->num_dmabuf_slots);
+	return 0;
 }
 
 /**
@@ -1557,71 +1583,78 @@ static int stitcher_dmabuf_resync_sources(struct uvc_stitcher *stitcher)
  */
 static int stitcher_warmup_sync(struct uvc_stitcher *stitcher)
 {
-    unsigned int w_idx0, w_idx1;
-    u32 w_seq0, w_seq1;
-    int attempt, n, ret;
+	unsigned int w_idx0, w_idx1;
+	u32 w_seq0, w_seq1;
+	int attempt, n, ret;
 
-    for (attempt = 0; attempt <= STITCHER_SYNC_MAX_RETRIES; attempt++) {
-        w_seq0 = 0;
-        w_seq1 = 0;
+	for (attempt = 0; attempt <= STITCHER_SYNC_MAX_RETRIES; attempt++) {
+		w_seq0 = 0;
+		w_seq1 = 0;
 
-        for (n = 0; n < STITCHER_SYNC_DRAIN_FRAMES; n++) {
-            ret = stitcher_dqbuf_src_dmabuf(stitcher, 0, &w_idx0, &w_seq0);
-            if (ret)
-                return ret;
+		for (n = 0; n < STITCHER_SYNC_DRAIN_FRAMES; n++) {
+			ret = stitcher_dqbuf_src_dmabuf(stitcher, 0, &w_idx0,
+							&w_seq0);
+			if (ret)
+				return ret;
 
-            ret = stitcher_dqbuf_src_dmabuf(stitcher, 1, &w_idx1, &w_seq1);
-            if (ret) {
-                stitcher_qbuf_src_dmabuf(stitcher, 0, w_idx0,
-                                      stitcher->dma_slots[w_idx0].cached_fd[0]);
-                return ret;
-            }
+			ret = stitcher_dqbuf_src_dmabuf(stitcher, 1, &w_idx1,
+							&w_seq1);
+			if (ret) {
+				stitcher_qbuf_src_dmabuf(
+					stitcher, 0, w_idx0,
+					stitcher->dma_slots[w_idx0]
+						.cached_fd[0]);
+				return ret;
+			}
 
-            stitcher_requeue_pair_dmabuf(stitcher, w_idx0, w_idx1);
-        }
+			stitcher_requeue_pair_dmabuf(stitcher, w_idx0, w_idx1);
+		}
 
-        if (w_seq0 == w_seq1) {
-            pr_info("uvc_stitcher: synced at seq %u (attempt %d, drained %d)\n",
-                    w_seq0, attempt, STITCHER_SYNC_DRAIN_FRAMES);
-            return 0;
-        }
+		if (w_seq0 == w_seq1) {
+			pr_info("uvc_stitcher: synced at seq %u (attempt %d, drained %d)\n",
+				w_seq0, attempt, STITCHER_SYNC_DRAIN_FRAMES);
+			return 0;
+		}
 
-        if (attempt < STITCHER_SYNC_MAX_RETRIES) {
-            pr_warn("uvc_stitcher: sequence mismatch after draining %d frames: "
-                    "src0 seq=%u vs src1 seq=%u (attempt %d)\n",
-                    STITCHER_SYNC_DRAIN_FRAMES, w_seq0, w_seq1, attempt);
-            ret = stitcher_dmabuf_resync_sources(stitcher);
-            if (ret) {
-                pr_err("uvc_stitcher: failed to resync sources: %d\n", ret);
-                return ret;
-            }
-        }
-    }
+		if (attempt < STITCHER_SYNC_MAX_RETRIES) {
+			pr_warn("uvc_stitcher: sequence mismatch after draining %d frames: "
+				"src0 seq=%u vs src1 seq=%u (attempt %d)\n",
+				STITCHER_SYNC_DRAIN_FRAMES, w_seq0, w_seq1,
+				attempt);
+			ret = stitcher_dmabuf_resync_sources(stitcher);
+			if (ret) {
+				pr_err("uvc_stitcher: failed to resync sources: %d\n",
+				       ret);
+				return ret;
+			}
+		}
+	}
 
-    pr_warn("uvc_stitcher: sync failed after %d retries (seq %u vs %u), proceeding\n",
-            STITCHER_SYNC_MAX_RETRIES, w_seq0, w_seq1);
-    return 0;
+	pr_warn("uvc_stitcher: sync failed after %d retries (seq %u vs %u), proceeding\n",
+		STITCHER_SYNC_MAX_RETRIES, w_seq0, w_seq1);
+	return 0;
 }
 
 static int stitcher_thread_fn(void *data)
 {
 	struct uvc_stitcher *stitcher = data;
-    const bool dmabuf_mode = stitcher->use_dmabuf;
+	const bool dmabuf_mode = stitcher->use_dmabuf;
 	struct stitcher_video_buffer *mbuf;
 	struct vb2_buffer *out_vb;
 	unsigned long flags;
 	u64 half_size;
 	u32 pixfmt;
-    u32 out_size;
+	u32 out_size;
 	int ret;
 
 	sched_set_fifo(current);
 
 	mutex_lock(&stitcher->lock);
 	pixfmt = stitcher->out_pixfmt;
-    out_size = stitcher_image_size(stitcher->out_width, stitcher->out_height, pixfmt);
+	out_size = stitcher_image_size(stitcher->out_width,
+				       stitcher->out_height, pixfmt);
 	mutex_unlock(&stitcher->lock);
-    half_size = (u64)out_size / 2;
+	half_size = (u64)out_size / 2;
 
 	if (dmabuf_mode) {
 		/**
@@ -1645,10 +1678,10 @@ static int stitcher_thread_fn(void *data)
 		}
 
 		ret = stitcher_warmup_sync(stitcher);
-        if (ret) {
-            pr_err("uvc_stitcher: warm-up sync failed: %d\n", ret);
-            goto dmabuf_exit;
-        }
+		if (ret) {
+			pr_err("uvc_stitcher: warm-up sync failed: %d\n", ret);
+			goto dmabuf_exit;
+		}
 
 		while (!kthread_should_stop()) {
 			unsigned int idx0, idx1;
@@ -1658,8 +1691,9 @@ static int stitcher_thread_fn(void *data)
 			ret = wait_event_interruptible(
 				stitcher->out_q.buf_wq,
 				atomic_read(&stitcher->bufs_in_flight) > 0 ||
-				!list_empty(&stitcher->out_q.irqqueue) ||
-				stitcher_should_stop(stitcher));
+					!list_empty(
+						&stitcher->out_q.irqqueue) ||
+					stitcher_should_stop(stitcher));
 
 			if (stitcher_should_stop(stitcher))
 				break;
@@ -1669,18 +1703,23 @@ static int stitcher_thread_fn(void *data)
 			/* Re-submit output buffers that userspace re-QBUF'd */
 			spin_lock_irqsave(&stitcher->out_q.irqlock, flags);
 			while (!list_empty(&stitcher->out_q.irqqueue)) {
-				mbuf = list_first_entry(&stitcher->out_q.irqqueue,
-				                        struct stitcher_video_buffer, queue);
+				mbuf = list_first_entry(
+					&stitcher->out_q.irqqueue,
+					struct stitcher_video_buffer, queue);
 				list_del(&mbuf->queue);
-				spin_unlock_irqrestore(&stitcher->out_q.irqlock, flags);
+				spin_unlock_irqrestore(&stitcher->out_q.irqlock,
+						       flags);
 
 				i = mbuf->buf.vb2_buf.index;
 				for (int s = 0; s < STITCHER_NUM_SOURCES; s++)
-					stitcher_qbuf_src_dmabuf(stitcher, s, i,
-					                      stitcher->dma_slots[i].cached_fd[s]);
+					stitcher_qbuf_src_dmabuf(
+						stitcher, s, i,
+						stitcher->dma_slots[i]
+							.cached_fd[s]);
 				atomic_inc(&stitcher->bufs_in_flight);
 
-				spin_lock_irqsave(&stitcher->out_q.irqlock, flags);
+				spin_lock_irqsave(&stitcher->out_q.irqlock,
+						  flags);
 			}
 			spin_unlock_irqrestore(&stitcher->out_q.irqlock, flags);
 
@@ -1690,18 +1729,23 @@ static int stitcher_thread_fn(void *data)
 				continue;
 
 			/* DQBUF from both sources (blocking) */
-			ret = stitcher_dqbuf_src_dmabuf(stitcher, 0, &idx0, &seq0);
+			ret = stitcher_dqbuf_src_dmabuf(stitcher, 0, &idx0,
+							&seq0);
 			if (ret) {
-				if (stitcher_should_stop(stitcher) || stitcher_is_fatal_err(ret))
+				if (stitcher_should_stop(stitcher) ||
+				    stitcher_is_fatal_err(ret))
 					break;
 				continue;
 			}
 
-			ret = stitcher_dqbuf_src_dmabuf(stitcher, 1, &idx1, &seq1);
+			ret = stitcher_dqbuf_src_dmabuf(stitcher, 1, &idx1,
+							&seq1);
 			if (ret) {
-				stitcher_qbuf_src_dmabuf(stitcher, 0, idx0,
-				                      stitcher->dma_slots[idx0].cached_fd[0]);
-				if (stitcher_should_stop(stitcher) || stitcher_is_fatal_err(ret))
+				stitcher_qbuf_src_dmabuf(
+					stitcher, 0, idx0,
+					stitcher->dma_slots[idx0].cached_fd[0]);
+				if (stitcher_should_stop(stitcher) ||
+				    stitcher_is_fatal_err(ret))
 					break;
 				continue;
 			}
@@ -1709,8 +1753,9 @@ static int stitcher_thread_fn(void *data)
 			/* Discard mismatched pairs */
 			if (idx0 != idx1) {
 				pr_warn("uvc_stitcher: DQBUF index mismatch %u vs %u\n",
-				        idx0, idx1);
-				stitcher_requeue_pair_dmabuf(stitcher, idx0, idx1);
+					idx0, idx1);
+				stitcher_requeue_pair_dmabuf(stitcher, idx0,
+							     idx1);
 				continue;
 			}
 			if (seq0 != seq1) {
@@ -1718,7 +1763,8 @@ static int stitcher_thread_fn(void *data)
 					"uvc_stitcher: seq mismatch %u vs %u, "
 					"discarding pair idx %u\n",
 					seq0, seq1, idx0);
-				stitcher_requeue_pair_dmabuf(stitcher, idx0, idx1);
+				stitcher_requeue_pair_dmabuf(stitcher, idx0,
+							     idx1);
 				continue;
 			}
 
@@ -1731,7 +1777,8 @@ static int stitcher_thread_fn(void *data)
 
 			out_vb = stitcher->out_vb_map[idx0];
 			if (!out_vb) {
-				pr_err("uvc_stitcher: out_vb_map[%u] NULL\n", idx0);
+				pr_err("uvc_stitcher: out_vb_map[%u] NULL\n",
+				       idx0);
 				break;
 			}
 
@@ -1751,7 +1798,7 @@ dmabuf_exit:
 			ret = wait_event_interruptible(
 				stitcher->out_q.buf_wq,
 				!list_empty(&stitcher->out_q.irqqueue) ||
-				stitcher_should_stop(stitcher));
+					stitcher_should_stop(stitcher));
 
 			if (stitcher_should_stop(stitcher))
 				break;
@@ -1760,11 +1807,13 @@ dmabuf_exit:
 
 			spin_lock_irqsave(&stitcher->out_q.irqlock, flags);
 			if (list_empty(&stitcher->out_q.irqqueue)) {
-				spin_unlock_irqrestore(&stitcher->out_q.irqlock, flags);
+				spin_unlock_irqrestore(&stitcher->out_q.irqlock,
+						       flags);
 				continue;
 			}
 			mbuf = list_first_entry(&stitcher->out_q.irqqueue,
-			                        struct stitcher_video_buffer, queue);
+						struct stitcher_video_buffer,
+						queue);
 			list_del(&mbuf->queue);
 			spin_unlock_irqrestore(&stitcher->out_q.irqlock, flags);
 
@@ -1779,7 +1828,8 @@ dmabuf_exit:
 				if (!atomic_read(&stitcher->streaming))
 					goto return_buf;
 				if (stitcher_is_fatal_err(ret)) {
-					vb2_buffer_done(out_vb, VB2_BUF_STATE_ERROR);
+					vb2_buffer_done(out_vb,
+							VB2_BUF_STATE_ERROR);
 					break;
 				}
 				stitcher_requeue_outbuf(&stitcher->out_q, mbuf);
@@ -1797,7 +1847,8 @@ dmabuf_exit:
 				if (!atomic_read(&stitcher->streaming))
 					goto return_buf;
 				if (stitcher_is_fatal_err(ret)) {
-					vb2_buffer_done(out_vb, VB2_BUF_STATE_ERROR);
+					vb2_buffer_done(out_vb,
+							VB2_BUF_STATE_ERROR);
 					break;
 				}
 				stitcher_requeue_outbuf(&stitcher->out_q, mbuf);
@@ -1815,7 +1866,8 @@ dmabuf_exit:
 				continue;
 			}
 
-			stitcher_stitch_memcpy(dst, src0_va, src1_va, half_size);
+			stitcher_stitch_memcpy(dst, src0_va, src1_va,
+					       half_size);
 
 			stitcher_qbuf_src_mmap(stitcher, 0);
 			stitcher_qbuf_src_mmap(stitcher, 1);
@@ -1847,7 +1899,7 @@ return_buf:
  * vb2 queue operations
  */
 static void stitcher_video_queue_return_buffers(struct stitcher_video_queue *q,
-					     enum vb2_buffer_state state)
+						enum vb2_buffer_state state)
 {
 	while (!list_empty(&q->irqqueue)) {
 		struct stitcher_video_buffer *mbuf = list_first_entry(
@@ -1857,49 +1909,53 @@ static void stitcher_video_queue_return_buffers(struct stitcher_video_queue *q,
 	}
 }
 
-static int stitcher_queue_setup(struct vb2_queue *vbq, unsigned int *num_buffers,
-			                 unsigned int *num_planes, unsigned int sizes[],
-			                 struct device *alloc_devs[])
+static int stitcher_queue_setup(struct vb2_queue *vbq,
+				unsigned int *num_buffers,
+				unsigned int *num_planes, unsigned int sizes[],
+				struct device *alloc_devs[])
 {
 	struct stitcher_video_queue *q = vb2_get_drv_priv(vbq);
-	struct uvc_stitcher *stitcher = container_of(q, struct uvc_stitcher, out_q);
+	struct uvc_stitcher *stitcher =
+		container_of(q, struct uvc_stitcher, out_q);
 	unsigned int size;
 
 	mutex_lock(&stitcher->lock);
 	size = stitcher_image_size(stitcher->out_width, stitcher->out_height,
-				            stitcher->out_pixfmt);
+				   stitcher->out_pixfmt);
 	mutex_unlock(&stitcher->lock);
 
 	pr_debug("uvc_stitcher: queue_setup (nplanes=%d, nbuffers=%d)\n",
-     		 *num_planes, *num_buffers);
+		 *num_planes, *num_buffers);
 	if (*num_planes)
 		return sizes[0] < size ? -EINVAL : 0;
 
 	*num_planes = 1;
 	sizes[0] = size;
-	*num_buffers = clamp_t(unsigned int, *num_buffers, 2, STITCHER_MAX_OUT_BUFS);
+	*num_buffers =
+		clamp_t(unsigned int, *num_buffers, 2, STITCHER_MAX_OUT_BUFS);
 
-	pr_info("uvc_stitcher: queue_setup size=%u buffers=%u\n",
-	    	size, *num_buffers);
+	pr_info("uvc_stitcher: queue_setup size=%u buffers=%u\n", size,
+		*num_buffers);
 	return 0;
 }
 
 static int stitcher_buf_prepare(struct vb2_buffer *vb)
 {
 	struct stitcher_video_queue *q = vb2_get_drv_priv(vb->vb2_queue);
-	struct uvc_stitcher *stitcher = container_of(q, struct uvc_stitcher, out_q);
+	struct uvc_stitcher *stitcher =
+		container_of(q, struct uvc_stitcher, out_q);
 	unsigned int size;
 
 	mutex_lock(&stitcher->lock);
 	size = stitcher_image_size(stitcher->out_width, stitcher->out_height,
-				stitcher->out_pixfmt);
+				   stitcher->out_pixfmt);
 	mutex_unlock(&stitcher->lock);
 
 	if (vb2_plane_size(vb, 0) < size) {
 		pr_err("uvc_stitcher: buffer plane size < required %d\n", size);
 		return -EINVAL;
 	}
-    
+
 	return 0;
 }
 
@@ -1923,18 +1979,21 @@ static void stitcher_buf_queue(struct vb2_buffer *vb)
 static int stitcher_start_streaming(struct vb2_queue *vbq, unsigned int count)
 {
 	struct stitcher_video_queue *q = vb2_get_drv_priv(vbq);
-	struct uvc_stitcher *stitcher = container_of(q, struct uvc_stitcher, out_q);
+	struct uvc_stitcher *stitcher =
+		container_of(q, struct uvc_stitcher, out_q);
 	unsigned long flags;
 	int ret;
 
-	pr_info("uvc_stitcher: start_streaming called with %u buffers\n", count);
+	pr_info("uvc_stitcher: start_streaming called with %u buffers\n",
+		count);
 	lockdep_assert_irqs_enabled();
 
 	ret = stitcher_uvc_start(stitcher);
-	if (ret) {		
+	if (ret) {
 		unsigned int i, num;
 
-		pr_err("uvc_stitcher: uvc_start failed: %d, returning buffers\n", ret);
+		pr_err("uvc_stitcher: uvc_start failed: %d, returning buffers\n",
+		       ret);
 
 		/* Return buffers still in irqqueue */
 		spin_lock_irqsave(&q->irqlock, flags);
@@ -1965,7 +2024,8 @@ static int stitcher_start_streaming(struct vb2_queue *vbq, unsigned int count)
 static void stitcher_stop_streaming(struct vb2_queue *vbq)
 {
 	struct stitcher_video_queue *q = vb2_get_drv_priv(vbq);
-	struct uvc_stitcher *stitcher = container_of(q, struct uvc_stitcher, out_q);
+	struct uvc_stitcher *stitcher =
+		container_of(q, struct uvc_stitcher, out_q);
 	unsigned long flags;
 	unsigned int i, num;
 	int s;
@@ -2046,7 +2106,7 @@ static int init_queue(struct stitcher_video_queue *q)
 /* ------------------------------------------------------------------ */
 /* vidioc_streamon */
 static int stitcher_vidioc_streamon(struct file *file, void *fh,
-				                 enum v4l2_buf_type type)
+				    enum v4l2_buf_type type)
 {
 	struct uvc_stitcher *stitcher = video_drvdata(file);
 	int ret;
@@ -2072,7 +2132,7 @@ static int stitcher_vidioc_streamon(struct file *file, void *fh,
  * then call vb2_ioctl_streamoff to complete the stream off process
  */
 static int stitcher_vidioc_streamoff(struct file *file, void *fh,
-                                  enum v4l2_buf_type type)
+				     enum v4l2_buf_type type)
 {
 	if (type != V4L2_BUF_TYPE_VIDEO_CAPTURE)
 		return -EINVAL;
@@ -2081,7 +2141,7 @@ static int stitcher_vidioc_streamoff(struct file *file, void *fh,
 }
 
 static int stitcher_vidioc_querycap(struct file *file, void *fh,
-	                			 struct v4l2_capability *cap)
+				    struct v4l2_capability *cap)
 {
 	strscpy(cap->driver, "UVC Teaming", sizeof(cap->driver));
 	strscpy(cap->card, "UVC Teaming", sizeof(cap->card));
@@ -2096,7 +2156,7 @@ static const u32 stitcher_formats[] = {
 #define MIXER_NUM_FORMATS ARRAY_SIZE(stitcher_formats)
 
 static int stitcher_vidioc_enum_fmt(struct file *file, void *fh,
-			                	 struct v4l2_fmtdesc *fmtdesc)
+				    struct v4l2_fmtdesc *fmtdesc)
 {
 	if (fmtdesc->type != V4L2_BUF_TYPE_VIDEO_CAPTURE)
 		return -EINVAL;
@@ -2114,16 +2174,17 @@ static void fill_fmt(struct uvc_stitcher *stitcher, struct v4l2_format *f)
 	f->fmt.pix.height = stitcher->out_height;
 	f->fmt.pix.pixelformat = stitcher->out_pixfmt;
 	f->fmt.pix.field = V4L2_FIELD_NONE;
-	f->fmt.pix.bytesperline =
-		stitcher_bytesperline(stitcher->out_width, stitcher->out_pixfmt);
-	f->fmt.pix.sizeimage = 
-        stitcher_image_size(stitcher->out_width, stitcher->out_height, stitcher->out_pixfmt);
+	f->fmt.pix.bytesperline = stitcher_bytesperline(stitcher->out_width,
+							stitcher->out_pixfmt);
+	f->fmt.pix.sizeimage = stitcher_image_size(stitcher->out_width,
+						   stitcher->out_height,
+						   stitcher->out_pixfmt);
 	f->fmt.pix.colorspace = V4L2_COLORSPACE_SRGB;
 	mutex_unlock(&stitcher->lock);
 }
 
 static int stitcher_vidioc_g_fmt(struct file *file, void *fh,
-			                  struct v4l2_format *fmt)
+				 struct v4l2_format *fmt)
 {
 	struct uvc_stitcher *stitcher = video_drvdata(file);
 
@@ -2135,7 +2196,7 @@ static int stitcher_vidioc_g_fmt(struct file *file, void *fh,
 }
 
 static int stitcher_vidioc_s_fmt(struct file *file, void *fh,
-            			      struct v4l2_format *fmt)
+				 struct v4l2_format *fmt)
 {
 	struct uvc_stitcher *stitcher = video_drvdata(file);
 
@@ -2145,17 +2206,19 @@ static int stitcher_vidioc_s_fmt(struct file *file, void *fh,
 	/* Accept YUYV or NV12.  Anything else falls back to NV12. */
 	mutex_lock(&stitcher->lock);
 	stitcher->out_pixfmt = stitcher_pixfmt_valid(fmt->fmt.pix.pixelformat) ?
-				    fmt->fmt.pix.pixelformat :
-				    V4L2_PIX_FMT_NV12;
+				       fmt->fmt.pix.pixelformat :
+				       V4L2_PIX_FMT_NV12;
 
 	if (fmt->fmt.pix.width > 0 && fmt->fmt.pix.height >= 2) {
 		stitcher->out_width = fmt->fmt.pix.width;
-		stitcher->out_height = fmt->fmt.pix.height & ~1u; /* round down to even */
+		stitcher->out_height = fmt->fmt.pix.height &
+				       ~1u; /* round down to even */
 		stitcher->src_width = stitcher->out_width;
 		stitcher->src_height = stitcher->out_height / 2;
 		pr_info("uvc_stitcher: s_fmt accepted %ux%u fmt=0x%X (src %ux%u)\n",
-			    stitcher->out_width, stitcher->out_height, stitcher->out_pixfmt,
-			    stitcher->src_width, stitcher->src_height);
+			stitcher->out_width, stitcher->out_height,
+			stitcher->out_pixfmt, stitcher->src_width,
+			stitcher->src_height);
 	}
 	mutex_unlock(&stitcher->lock);
 
@@ -2165,7 +2228,7 @@ static int stitcher_vidioc_s_fmt(struct file *file, void *fh,
 }
 
 static int stitcher_vidioc_try_fmt(struct file *file, void *fh,
-			                	struct v4l2_format *fmt)
+				   struct v4l2_format *fmt)
 {
 	struct uvc_stitcher *stitcher = video_drvdata(file);
 	u32 pixfmt;
@@ -2193,26 +2256,26 @@ static int stitcher_vidioc_try_fmt(struct file *file, void *fh,
 
 	fmt->fmt.pix.bytesperline =
 		stitcher_bytesperline(fmt->fmt.pix.width, pixfmt);
-	fmt->fmt.pix.sizeimage = 
-        stitcher_image_size(fmt->fmt.pix.width,
-						 fmt->fmt.pix.height, pixfmt);
+	fmt->fmt.pix.sizeimage = stitcher_image_size(
+		fmt->fmt.pix.width, fmt->fmt.pix.height, pixfmt);
 	return 0;
 }
 
-static int stitcher_vidioc_s_input(struct file *file, void *fh, unsigned int input)
+static int stitcher_vidioc_s_input(struct file *file, void *fh,
+				   unsigned int input)
 {
 	return input ? -EINVAL : 0;
 }
 
 static int stitcher_vidioc_g_input(struct file *file, void *fh,
-				unsigned int *input)
+				   unsigned int *input)
 {
 	*input = 0;
 	return 0;
 }
 
 static int stitcher_vidioc_enum_input(struct file *file, void *fh,
-				   struct v4l2_input *input)
+				      struct v4l2_input *input)
 {
 	if (input->index != 0)
 		return -EINVAL;
@@ -2223,7 +2286,7 @@ static int stitcher_vidioc_enum_input(struct file *file, void *fh,
 }
 
 static int stitcher_vidioc_g_parm(struct file *file, void *fh,
-			       struct v4l2_streamparm *a)
+				  struct v4l2_streamparm *a)
 {
 	struct uvc_stitcher *stitcher = video_drvdata(file);
 
@@ -2242,7 +2305,7 @@ static int stitcher_vidioc_g_parm(struct file *file, void *fh,
 }
 
 static int stitcher_vidioc_s_parm(struct file *file, void *fh,
-			       struct v4l2_streamparm *a)
+				  struct v4l2_streamparm *a)
 {
 	struct uvc_stitcher *stitcher = video_drvdata(file);
 
@@ -2255,7 +2318,7 @@ static int stitcher_vidioc_s_parm(struct file *file, void *fh,
 		stitcher->fps_num = a->parm.capture.timeperframe.numerator;
 		stitcher->fps_den = a->parm.capture.timeperframe.denominator;
 		pr_info("uvc_stitcher: s_parm fps=%u/%u\n", stitcher->fps_den,
-			    stitcher->fps_num);
+			stitcher->fps_num);
 	}
 	mutex_unlock(&stitcher->lock);
 
@@ -2264,7 +2327,7 @@ static int stitcher_vidioc_s_parm(struct file *file, void *fh,
 }
 
 static int stitcher_vidioc_enum_framesizes(struct file *file, void *fh,
-			                    		struct v4l2_frmsizeenum *fsize)
+					   struct v4l2_frmsizeenum *fsize)
 {
 	struct uvc_stitcher *stitcher = video_drvdata(file);
 	struct stitcher_slot *src;
@@ -2274,13 +2337,15 @@ static int stitcher_vidioc_enum_framesizes(struct file *file, void *fh,
 		return -EINVAL;
 
 	mutex_lock(&stitcher->src_disc_lock);
-	if (stitcher->src_ready_count < 1 || !stitcher_src_valid(&stitcher->src[0])) {
+	if (stitcher->src_ready_count < 1 ||
+	    !stitcher_src_valid(&stitcher->src[0])) {
 		mutex_unlock(&stitcher->src_disc_lock);
 		return -ENODEV;
 	}
 	src = &stitcher->src[0];
 
-	ret = UVC_CALL_OP(src, vidioc_enum_framesizes, src->filp, src->fh, fsize);
+	ret = UVC_CALL_OP(src, vidioc_enum_framesizes, src->filp, src->fh,
+			  fsize);
 	mutex_unlock(&stitcher->src_disc_lock);
 
 	if (ret)
@@ -2303,7 +2368,7 @@ static int stitcher_vidioc_enum_framesizes(struct file *file, void *fh,
 }
 
 static int stitcher_vidioc_enum_frameintervals(struct file *file, void *fh,
-					                        struct v4l2_frmivalenum *fival)
+					       struct v4l2_frmivalenum *fival)
 {
 	struct uvc_stitcher *stitcher = video_drvdata(file);
 	struct stitcher_slot *src;
@@ -2313,7 +2378,8 @@ static int stitcher_vidioc_enum_frameintervals(struct file *file, void *fh,
 		return -EINVAL;
 
 	mutex_lock(&stitcher->src_disc_lock);
-	if (stitcher->src_ready_count < 1 || !stitcher_src_valid(&stitcher->src[0])) {
+	if (stitcher->src_ready_count < 1 ||
+	    !stitcher_src_valid(&stitcher->src[0])) {
 		mutex_unlock(&stitcher->src_disc_lock);
 		return -ENODEV;
 	}
@@ -2326,7 +2392,7 @@ static int stitcher_vidioc_enum_frameintervals(struct file *file, void *fh,
 	fival->height /= 2;
 
 	ret = UVC_CALL_OP(src, vidioc_enum_frameintervals, src->filp, src->fh,
-			          fival);
+			  fival);
 
 	/* Restore height to stitcher output value for userspace */
 	fival->height *= 2;

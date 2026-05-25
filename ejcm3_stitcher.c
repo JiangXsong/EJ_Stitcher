@@ -42,7 +42,7 @@
  * UVC_CALL_OP - call a UVC ioctl op directly, holding the vdev lock.
  *
  * NOTE: This bypasses V4L2 core's capability checks and v4l2_fh state
- * validation. It is intentional for this kernel-space teaming design, but
+ * validation. It is intentional for this kernel-space stitching design, but
  * callers must ensure the source filp/vdev remain valid (protected by
  * src_disc_lock or uvc_ctrl_lock as appropriate).
  */
@@ -79,14 +79,14 @@ struct stitcher_slot {
 struct stitcher_dmabuf_priv {
 	struct page **pages;
 	unsigned int num_pages;
-	unsigned int offset; /* byte offset within first page */
-	size_t size; /* total byte length */
+	unsigned int offset;
+	size_t size;
 };
 
-/*
+/**
  * Per-attachment cached SG table.
  * Created once on first map_dma_buf, reused on subsequent calls,
- * freed on detach.  Eliminates per-frame SG alloc + IOMMU remap.
+ * freed on detach.
  */
 struct stitcher_dmabuf_attach {
 	struct sg_table *sgt;
@@ -94,7 +94,7 @@ struct stitcher_dmabuf_attach {
 	bool mapped;
 };
 
-/*
+/**
  * Per-output-buffer DMABUF tracking.
  * Each output buffer has one dma_buf per source (covering its half).
  * cached_fd: persistent fd in init_files for kthread re-QBUF.
@@ -102,7 +102,7 @@ struct stitcher_dmabuf_attach {
 struct stitcher_dmabuf_slot {
 	struct dma_buf *dbuf[STITCHER_NUM_SOURCES];
 	int cached_fd[STITCHER_NUM_SOURCES];
-	struct page **pages; /* vmalloc page array for this buffer */
+	struct page **pages;
 	unsigned int num_pages;
 	bool created;
 };
@@ -188,7 +188,7 @@ MODULE_PARM_DESC(zerocopy,
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Syu-Song Chiang");
-MODULE_DESCRIPTION("UVC Teaming: Stitching two UVC sources in kernel space");
+MODULE_DESCRIPTION("UVC Stitcher: Stitching two UVC sources in kernel space");
 MODULE_IMPORT_NS("DMA_BUF");
 
 /* ------------------------------------------------------------------ */
@@ -221,7 +221,7 @@ static inline unsigned int stitcher_image_size(u32 w, u32 h, u32 pixfmt)
 {
 	if (pixfmt == V4L2_PIX_FMT_NV12)
 		return w * h * 3 / 2;
-	return w * h * 2; /* YUYV default */
+	return w * h * 2;
 }
 
 /**
@@ -233,7 +233,7 @@ static inline unsigned int stitcher_bytesperline(u32 w, u32 pixfmt)
 {
 	if (pixfmt == V4L2_PIX_FMT_NV12)
 		return w;
-	return w * 2; /* YUYV */
+	return w * 2;
 }
 
 static inline bool stitcher_pixfmt_valid(u32 pixfmt)
@@ -336,7 +336,7 @@ static void stitcher_dmabuf_unmap(struct dma_buf_attachment *attach,
 				  struct sg_table *sgt,
 				  enum dma_data_direction dir)
 {
-	/* Cached — freed on detach, not here */
+	/* Cached — freed on detach */
 }
 
 static int stitcher_dmabuf_pin(struct dma_buf_attachment *attach)
@@ -419,7 +419,7 @@ static const struct dma_buf_ops stitcher_dmabuf_ops = {
  * @size:      total byte size of the range
  *
  * The dma_buf holds a reference to priv, not to the pages themselves.
- * Pages must outlive the dma_buf (guaranteed: output buffer freed after dma_buf).
+ * Pages must outlive the dma_buf (output buffer freed after dma_buf).
  */
 static struct dma_buf *stitcher_create_dmabuf(struct page **pages,
 					      unsigned int num_pages,
@@ -451,7 +451,8 @@ static struct dma_buf *stitcher_create_dmabuf(struct page **pages,
 }
 
 static int stitcher_dqbuf_src_dmabuf(struct uvc_stitcher *stitcher, int slot,
-				     unsigned int *out_index, u32 *out_sequence)
+				     unsigned int *out_index, u32 *out_sequence,
+				     ktime_t *out_ts)
 {
 	struct stitcher_slot *src = &stitcher->src[slot];
 	struct v4l2_buffer buf = {
@@ -477,6 +478,10 @@ static int stitcher_dqbuf_src_dmabuf(struct uvc_stitcher *stitcher, int slot,
 	*out_index = buf.index;
 	if (out_sequence)
 		*out_sequence = buf.sequence;
+	if (out_ts)
+		*out_ts =
+			ns_to_ktime((u64)buf.timestamp.tv_sec * NSEC_PER_SEC +
+				    (u64)buf.timestamp.tv_usec * NSEC_PER_USEC);
 	return 0;
 }
 
@@ -484,7 +489,6 @@ static int stitcher_dqbuf_src_dmabuf(struct uvc_stitcher *stitcher, int slot,
  * stitcher_qbuf_src_dmabuf - QBUF a dma_buf to UVC source via fd.
  *
  * @fd: file descriptor pointing to the dma_buf.
- *      Can be a temporary fd (initial QBUF) or cached fd (re-QBUF).
  */
 static int stitcher_qbuf_src_dmabuf(struct uvc_stitcher *stitcher, int slot,
 				    unsigned int buf_index, int fd)
@@ -514,7 +518,6 @@ static int stitcher_qbuf_src_dmabuf(struct uvc_stitcher *stitcher, int slot,
  * stitcher_dmabuf_qbuf_with_tmpfd - QBUF using a temporary fd.
  *
  * Creates a temporary fd in current->files, calls QBUF, closes fd.
- * Used for initial pre-QBUF in ioctl context.
  */
 static int stitcher_dmabuf_qbuf_with_tmpfd(struct uvc_stitcher *stitcher,
 					   int slot, unsigned int buf_index,
@@ -537,9 +540,6 @@ static int stitcher_dmabuf_qbuf_with_tmpfd(struct uvc_stitcher *stitcher,
 
 /**
  * stitcher_dmabuf_create_cached_fds - create persistent fds for re-QBUF.
- *
- * Must be called from kthread context (current->files = init_files).
- * FDs are installed in init_files and cached in dma_slots[].cached_fd[].
  */
 static int stitcher_dmabuf_create_cached_fds(struct uvc_stitcher *stitcher)
 {
@@ -575,9 +575,6 @@ static int stitcher_dmabuf_create_cached_fds(struct uvc_stitcher *stitcher)
 
 /**
  * stitcher_dmabuf_close_cached_fds - close all cached fds.
- *
- * Must be called from kthread context (same init_files where fds live).
- * Called just before kthread exits.
  */
 static void stitcher_dmabuf_close_cached_fds(struct uvc_stitcher *stitcher)
 {
@@ -806,7 +803,6 @@ static struct vb2_queue *stitcher_get_uvc_vbq(struct stitcher_slot *src)
 	return vbq;
 }
 
-/* ------------------------------------------------------------------ */
 /**
  * stitcher_disc_work_fn - workqueue function for device discovery/removal.
  * 
@@ -1593,12 +1589,12 @@ static int stitcher_warmup_sync(struct uvc_stitcher *stitcher)
 
 		for (n = 0; n < STITCHER_SYNC_DRAIN_FRAMES; n++) {
 			ret = stitcher_dqbuf_src_dmabuf(stitcher, 0, &w_idx0,
-							&w_seq0);
+							&w_seq0, NULL);
 			if (ret)
 				return ret;
 
 			ret = stitcher_dqbuf_src_dmabuf(stitcher, 1, &w_idx1,
-							&w_seq1);
+							&w_seq1, NULL);
 			if (ret) {
 				stitcher_qbuf_src_dmabuf(
 					stitcher, 0, w_idx0,
@@ -1635,251 +1631,227 @@ static int stitcher_warmup_sync(struct uvc_stitcher *stitcher)
 	return 0;
 }
 
-static int stitcher_thread_fn(void *data)
+/* ------------------------------------------------------------------ */
+/* kthread                                                            */
+/* ------------------------------------------------------------------ */
+/**
+ * DMABUF feed-through path
+ *
+ * Output buffer pages are exported as dma_buf and pre-queued to UVC sources.
+ * Kthread just waits for DMA completion, signals done, re-queues.
+ */
+static void stitcher_dma(struct uvc_stitcher *stitcher, u32 out_size)
 {
-	struct uvc_stitcher *stitcher = data;
-	const bool dmabuf_mode = stitcher->use_dmabuf;
 	struct stitcher_video_buffer *mbuf;
 	struct vb2_buffer *out_vb;
+	struct vb2_v4l2_buffer *v4l2_vb;
 	unsigned long flags;
-	u64 half_size;
-	u32 pixfmt;
-	u32 out_size;
-	int ret;
+	unsigned int idx0, idx1;
+	u32 seq0 = 0, seq1 = 0;
+	ktime_t ts0 = 0, ts1 = 0;
+	int i, ret;
 
-	sched_set_fifo(current);
+	/* create cached fds in init_files */
+	ret = stitcher_dmabuf_create_cached_fds(stitcher);
+	if (ret) {
+		pr_err("uvc_stitcher: failed to create cached fds: %d\n", ret);
+		goto dmabuf_exit;
+	}
 
-	mutex_lock(&stitcher->lock);
-	pixfmt = stitcher->out_pixfmt;
-	out_size = stitcher_image_size(stitcher->out_width,
-				       stitcher->out_height, pixfmt);
-	mutex_unlock(&stitcher->lock);
-	half_size = (u64)out_size / 2;
+	ret = stitcher_warmup_sync(stitcher);
+	if (ret) {
+		pr_err("uvc_stitcher: warm-up sync failed: %d\n", ret);
+		goto dmabuf_exit;
+	}
 
-	if (dmabuf_mode) {
-		/**
-		 * DMABUF feed-through path
-		 *
-		 * Output buffer pages are exported as dma_buf and
-		 * pre-queued to UVC sources.
-         * xHCI DMA writes directly to output pages.
-         * Kthread just waits for DMA completion, signals done, re-queues.
-		 *
-		 * FD caching: persistent fds in init_files avoid
-		 * per-frame get_unused_fd/fd_install/close_fd.
-		 */
-
-		/* create cached fds in init_files */
-		ret = stitcher_dmabuf_create_cached_fds(stitcher);
-		if (ret) {
-			pr_err("uvc_stitcher: failed to create cached fds: %d\n",
-			       ret);
-			goto dmabuf_exit;
-		}
-
-		ret = stitcher_warmup_sync(stitcher);
-		if (ret) {
-			pr_err("uvc_stitcher: warm-up sync failed: %d\n", ret);
-			goto dmabuf_exit;
-		}
-
-		while (!kthread_should_stop()) {
-			unsigned int idx0, idx1;
-			u32 seq0 = 0, seq1 = 0;
-			int i;
-
-			ret = wait_event_interruptible(
-				stitcher->out_q.buf_wq,
-				atomic_read(&stitcher->bufs_in_flight) > 0 ||
-					!list_empty(
-						&stitcher->out_q.irqqueue) ||
-					stitcher_should_stop(stitcher));
-
-			if (stitcher_should_stop(stitcher))
-				break;
-			if (ret == -ERESTARTSYS)
-				continue;
-
-			/* Re-submit output buffers that userspace re-QBUF'd */
-			spin_lock_irqsave(&stitcher->out_q.irqlock, flags);
-			while (!list_empty(&stitcher->out_q.irqqueue)) {
-				mbuf = list_first_entry(
-					&stitcher->out_q.irqqueue,
-					struct stitcher_video_buffer, queue);
-				list_del(&mbuf->queue);
-				spin_unlock_irqrestore(&stitcher->out_q.irqlock,
-						       flags);
-
-				i = mbuf->buf.vb2_buf.index;
-				for (int s = 0; s < STITCHER_NUM_SOURCES; s++)
-					stitcher_qbuf_src_dmabuf(
-						stitcher, s, i,
-						stitcher->dma_slots[i]
-							.cached_fd[s]);
-				atomic_inc(&stitcher->bufs_in_flight);
-
-				spin_lock_irqsave(&stitcher->out_q.irqlock,
-						  flags);
-			}
-			spin_unlock_irqrestore(&stitcher->out_q.irqlock, flags);
-
-			if (!atomic_read(&stitcher->streaming))
-				break;
-			if (atomic_read(&stitcher->bufs_in_flight) <= 0)
-				continue;
-
-			/* DQBUF from both sources (blocking) */
-			ret = stitcher_dqbuf_src_dmabuf(stitcher, 0, &idx0,
-							&seq0);
-			if (ret) {
-				if (stitcher_should_stop(stitcher) ||
-				    stitcher_is_fatal_err(ret))
-					break;
-				continue;
-			}
-
-			ret = stitcher_dqbuf_src_dmabuf(stitcher, 1, &idx1,
-							&seq1);
-			if (ret) {
-				stitcher_qbuf_src_dmabuf(
-					stitcher, 0, idx0,
-					stitcher->dma_slots[idx0].cached_fd[0]);
-				if (stitcher_should_stop(stitcher) ||
-				    stitcher_is_fatal_err(ret))
-					break;
-				continue;
-			}
-
-			/* Discard mismatched pairs */
-			if (idx0 != idx1) {
-				pr_warn("uvc_stitcher: DQBUF index mismatch %u vs %u\n",
-					idx0, idx1);
-				stitcher_requeue_pair_dmabuf(stitcher, idx0,
-							     idx1);
-				continue;
-			}
-			if (seq0 != seq1) {
-				pr_warn_ratelimited(
-					"uvc_stitcher: seq mismatch %u vs %u, "
-					"discarding pair idx %u\n",
-					seq0, seq1, idx0);
-				stitcher_requeue_pair_dmabuf(stitcher, idx0,
-							     idx1);
-				continue;
-			}
-
-			/* Output buffer idx0 is filled by DMA — signal done */
-			if (idx0 >= stitcher->num_dmabuf_slots) {
-				pr_err("uvc_stitcher: DQBUF index %u out of range\n",
-				       idx0);
-				break;
-			}
-
-			out_vb = stitcher->out_vb_map[idx0];
-			if (!out_vb) {
-				pr_err("uvc_stitcher: out_vb_map[%u] NULL\n",
-				       idx0);
-				break;
-			}
-
-			vb2_set_plane_payload(out_vb, 0, out_size);
-			out_vb->timestamp = ktime_get_ns();
-			vb2_buffer_done(out_vb, VB2_BUF_STATE_DONE);
-			atomic_dec(&stitcher->bufs_in_flight);
-		}
-
-dmabuf_exit:
-		/* Close cached fds in init_files before exiting */
-		stitcher_dmabuf_close_cached_fds(stitcher);
-	} else {
-		while (!kthread_should_stop()) {
-			void *src0_va, *src1_va, *dst;
-
-			ret = wait_event_interruptible(
-				stitcher->out_q.buf_wq,
+	while (!kthread_should_stop()) {
+		ret = wait_event_interruptible(
+			stitcher->out_q.buf_wq,
+			atomic_read(&stitcher->bufs_in_flight) > 0 ||
 				!list_empty(&stitcher->out_q.irqqueue) ||
-					stitcher_should_stop(stitcher));
+				stitcher_should_stop(stitcher));
 
-			if (stitcher_should_stop(stitcher))
-				break;
-			if (ret == -ERESTARTSYS)
-				continue;
+		if (stitcher_should_stop(stitcher))
+			break;
+		if (ret == -ERESTARTSYS)
+			continue;
 
-			spin_lock_irqsave(&stitcher->out_q.irqlock, flags);
-			if (list_empty(&stitcher->out_q.irqqueue)) {
-				spin_unlock_irqrestore(&stitcher->out_q.irqlock,
-						       flags);
-				continue;
-			}
+		/* Re-submit output buffers that userspace re-QBUF'd */
+		spin_lock_irqsave(&stitcher->out_q.irqlock, flags);
+		while (!list_empty(&stitcher->out_q.irqqueue)) {
 			mbuf = list_first_entry(&stitcher->out_q.irqqueue,
 						struct stitcher_video_buffer,
 						queue);
 			list_del(&mbuf->queue);
 			spin_unlock_irqrestore(&stitcher->out_q.irqlock, flags);
 
-			out_vb = &mbuf->buf.vb2_buf;
+			i = mbuf->buf.vb2_buf.index;
+			for (int s = 0; s < STITCHER_NUM_SOURCES; s++)
+				stitcher_qbuf_src_dmabuf(
+					stitcher, s, i,
+					stitcher->dma_slots[i].cached_fd[s]);
+			atomic_inc(&stitcher->bufs_in_flight);
 
-			if (!atomic_read(&stitcher->streaming))
-				goto return_buf;
-
-			/* DQBUF from UVC sources */
-			ret = stitcher_dqbuf_src_mmap(stitcher, 0);
-			if (ret) {
-				if (!atomic_read(&stitcher->streaming))
-					goto return_buf;
-				if (stitcher_is_fatal_err(ret)) {
-					vb2_buffer_done(out_vb,
-							VB2_BUF_STATE_ERROR);
-					break;
-				}
-				stitcher_requeue_outbuf(&stitcher->out_q, mbuf);
-				continue;
-			}
-
-			if (!atomic_read(&stitcher->streaming)) {
-				stitcher_qbuf_src_mmap(stitcher, 0);
-				goto return_buf;
-			}
-
-			ret = stitcher_dqbuf_src_mmap(stitcher, 1);
-			if (ret) {
-				stitcher_qbuf_src_mmap(stitcher, 0);
-				if (!atomic_read(&stitcher->streaming))
-					goto return_buf;
-				if (stitcher_is_fatal_err(ret)) {
-					vb2_buffer_done(out_vb,
-							VB2_BUF_STATE_ERROR);
-					break;
-				}
-				stitcher_requeue_outbuf(&stitcher->out_q, mbuf);
-				continue;
-			}
-
-			src0_va = vb2_plane_vaddr(stitcher->src[0].cur_vb, 0);
-			src1_va = vb2_plane_vaddr(stitcher->src[1].cur_vb, 0);
-			dst = vb2_plane_vaddr(out_vb, 0);
-
-			if (!dst || !src0_va || !src1_va) {
-				stitcher_qbuf_src_mmap(stitcher, 0);
-				stitcher_qbuf_src_mmap(stitcher, 1);
-				vb2_buffer_done(out_vb, VB2_BUF_STATE_ERROR);
-				continue;
-			}
-
-			stitcher_stitch_memcpy(dst, src0_va, src1_va,
-					       half_size);
-
-			stitcher_qbuf_src_mmap(stitcher, 0);
-			stitcher_qbuf_src_mmap(stitcher, 1);
-
-			vb2_set_plane_payload(out_vb, 0, out_size);
-			out_vb->timestamp = ktime_get_ns();
-			vb2_buffer_done(out_vb, VB2_BUF_STATE_DONE);
+			spin_lock_irqsave(&stitcher->out_q.irqlock, flags);
 		}
+		spin_unlock_irqrestore(&stitcher->out_q.irqlock, flags);
+
+		if (!atomic_read(&stitcher->streaming))
+			break;
+		if (atomic_read(&stitcher->bufs_in_flight) <= 0)
+			continue;
+
+		/* DQBUF from both sources (blocking) */
+		ret = stitcher_dqbuf_src_dmabuf(stitcher, 0, &idx0, &seq0,
+						&ts0);
+		if (ret) {
+			if (stitcher_should_stop(stitcher) ||
+			    stitcher_is_fatal_err(ret))
+				break;
+			continue;
+		}
+
+		ret = stitcher_dqbuf_src_dmabuf(stitcher, 1, &idx1, &seq1,
+						&ts1);
+		if (ret) {
+			stitcher_qbuf_src_dmabuf(
+				stitcher, 0, idx0,
+				stitcher->dma_slots[idx0].cached_fd[0]);
+			if (stitcher_should_stop(stitcher) ||
+			    stitcher_is_fatal_err(ret))
+				break;
+			continue;
+		}
+
+		/* Discard mismatched pairs */
+		if (idx0 != idx1) {
+			pr_warn("uvc_stitcher: DQBUF index mismatch %u vs %u\n",
+				idx0, idx1);
+			stitcher_requeue_pair_dmabuf(stitcher, idx0, idx1);
+			continue;
+		}
+		if (seq0 != seq1) {
+			pr_warn_ratelimited(
+				"uvc_stitcher: seq mismatch %u vs %u, "
+				"discarding pair idx %u\n",
+				seq0, seq1, idx0);
+			stitcher_requeue_pair_dmabuf(stitcher, idx0, idx1);
+			continue;
+		}
+
+		/* Output buffer idx0 is filled by DMA — signal done */
+		if (idx0 >= stitcher->num_dmabuf_slots) {
+			pr_err("uvc_stitcher: DQBUF index %u out of range\n",
+			       idx0);
+			break;
+		}
+
+		out_vb = stitcher->out_vb_map[idx0];
+		if (!out_vb) {
+			pr_err("uvc_stitcher: out_vb_map[%u] NULL\n", idx0);
+			break;
+		}
+		v4l2_vb = to_vb2_v4l2_buffer(out_vb);
+		vb2_set_plane_payload(out_vb, 0, out_size);
+
+		out_vb->timestamp =
+			ktime_to_ns(ktime_before(ts0, ts1) ? ts0 : ts1);
+		v4l2_vb->sequence = seq0;
+		vb2_buffer_done(out_vb, VB2_BUF_STATE_DONE);
+		atomic_dec(&stitcher->bufs_in_flight);
 	}
 
-	pr_info("uvc_stitcher: kthread exiting\n");
-	return 0;
+dmabuf_exit:
+	/* Close cached fds in init_files before exiting */
+	stitcher_dmabuf_close_cached_fds(stitcher);
+}
+
+static void stitcher_mmap(struct uvc_stitcher *stitcher, u32 out_size,
+			  u64 half_size)
+{
+	struct stitcher_video_buffer *mbuf;
+	struct vb2_buffer *out_vb;
+	unsigned long flags;
+	int ret;
+	void *src0_va, *src1_va, *dst;
+
+	while (!kthread_should_stop()) {
+		ret = wait_event_interruptible(
+			stitcher->out_q.buf_wq,
+			!list_empty(&stitcher->out_q.irqqueue) ||
+				stitcher_should_stop(stitcher));
+
+		if (stitcher_should_stop(stitcher))
+			break;
+		if (ret == -ERESTARTSYS)
+			continue;
+
+		spin_lock_irqsave(&stitcher->out_q.irqlock, flags);
+		if (list_empty(&stitcher->out_q.irqqueue)) {
+			spin_unlock_irqrestore(&stitcher->out_q.irqlock, flags);
+			continue;
+		}
+		mbuf = list_first_entry(&stitcher->out_q.irqqueue,
+					struct stitcher_video_buffer, queue);
+		list_del(&mbuf->queue);
+		spin_unlock_irqrestore(&stitcher->out_q.irqlock, flags);
+
+		out_vb = &mbuf->buf.vb2_buf;
+
+		if (!atomic_read(&stitcher->streaming))
+			goto return_buf;
+
+		/* DQBUF from UVC sources */
+		ret = stitcher_dqbuf_src_mmap(stitcher, 0);
+		if (ret) {
+			if (!atomic_read(&stitcher->streaming))
+				goto return_buf;
+			if (stitcher_is_fatal_err(ret)) {
+				vb2_buffer_done(out_vb, VB2_BUF_STATE_ERROR);
+				break;
+			}
+			stitcher_requeue_outbuf(&stitcher->out_q, mbuf);
+			continue;
+		}
+
+		if (!atomic_read(&stitcher->streaming)) {
+			stitcher_qbuf_src_mmap(stitcher, 0);
+			goto return_buf;
+		}
+
+		ret = stitcher_dqbuf_src_mmap(stitcher, 1);
+		if (ret) {
+			stitcher_qbuf_src_mmap(stitcher, 0);
+			if (!atomic_read(&stitcher->streaming))
+				goto return_buf;
+			if (stitcher_is_fatal_err(ret)) {
+				vb2_buffer_done(out_vb, VB2_BUF_STATE_ERROR);
+				break;
+			}
+			stitcher_requeue_outbuf(&stitcher->out_q, mbuf);
+			continue;
+		}
+
+		src0_va = vb2_plane_vaddr(stitcher->src[0].cur_vb, 0);
+		src1_va = vb2_plane_vaddr(stitcher->src[1].cur_vb, 0);
+		dst = vb2_plane_vaddr(out_vb, 0);
+
+		if (!dst || !src0_va || !src1_va) {
+			stitcher_qbuf_src_mmap(stitcher, 0);
+			stitcher_qbuf_src_mmap(stitcher, 1);
+			vb2_buffer_done(out_vb, VB2_BUF_STATE_ERROR);
+			continue;
+		}
+
+		stitcher_stitch_memcpy(dst, src0_va, src1_va, half_size);
+
+		stitcher_qbuf_src_mmap(stitcher, 0);
+		stitcher_qbuf_src_mmap(stitcher, 1);
+
+		vb2_set_plane_payload(out_vb, 0, out_size);
+		out_vb->timestamp = ktime_to_ns(stitcher->src[0].cur_ts);
+		vb2_buffer_done(out_vb, VB2_BUF_STATE_DONE);
+	}
 
 return_buf:
 	/*
@@ -1891,6 +1863,32 @@ return_buf:
 	list_add(&mbuf->queue, &stitcher->out_q.irqqueue);
 	spin_unlock_irqrestore(&stitcher->out_q.irqlock, flags);
 	pr_info("uvc_stitcher: kthread shutdown — returned output buffer to queue\n");
+}
+
+static int stitcher_thread_fn(void *data)
+{
+	struct uvc_stitcher *stitcher = data;
+	const bool dmabuf_mode = stitcher->use_dmabuf;
+	u64 half_size;
+	u32 pixfmt;
+	u32 out_size;
+
+	sched_set_fifo(current);
+
+	mutex_lock(&stitcher->lock);
+	pixfmt = stitcher->out_pixfmt;
+	out_size = stitcher_image_size(stitcher->out_width,
+				       stitcher->out_height, pixfmt);
+	mutex_unlock(&stitcher->lock);
+	half_size = (u64)out_size / 2;
+
+	if (dmabuf_mode) {
+		stitcher_dma(stitcher, out_size);
+	} else {
+		stitcher_mmap(stitcher, out_size, half_size);
+	}
+
+	pr_info("uvc_stitcher: kthread exiting\n");
 	return 0;
 }
 
@@ -2143,8 +2141,8 @@ static int stitcher_vidioc_streamoff(struct file *file, void *fh,
 static int stitcher_vidioc_querycap(struct file *file, void *fh,
 				    struct v4l2_capability *cap)
 {
-	strscpy(cap->driver, "UVC Teaming", sizeof(cap->driver));
-	strscpy(cap->card, "UVC Teaming", sizeof(cap->card));
+	strscpy(cap->driver, "UVC Stitcher", sizeof(cap->driver));
+	strscpy(cap->card, "UVC Stitcher", sizeof(cap->card));
 	strscpy(cap->bus_info, "platform:uvc_stitcher", sizeof(cap->bus_info));
 	return 0;
 }
@@ -2521,7 +2519,7 @@ static int stitcher_add(void)
 	stitcher->fps_num = STITCHER_DEFAULT_FPS_NUM;
 	stitcher->fps_den = STITCHER_DEFAULT_FPS_DEN;
 
-	stitcher->disc_wq = alloc_ordered_workqueue("uvc_teaming_disc", 0);
+	stitcher->disc_wq = alloc_ordered_workqueue("uvc_stitcher_disc", 0);
 	if (!stitcher->disc_wq) {
 		pr_err("uvc_stitcher: failed to allocate workqueue\n");
 		ret = -ENOMEM;
@@ -2641,18 +2639,18 @@ static void stitcher_remove(struct uvc_stitcher *stitcher)
 }
 
 /**/
-static int __init uvc_teaming_init(void)
+static int __init uvc_stitcher_init(void)
 {
 	pr_info("uvc_stitcher: module loading...\n");
 	return stitcher_add();
 }
 
-static void __exit uvc_teaming_exit(void)
+static void __exit uvc_stitcher_exit(void)
 {
 	pr_info("uvc_stitcher: module unloading...\n");
 	stitcher_remove(g_stitcher);
 	pr_info("uvc_stitcher: module unloaded\n");
 }
 
-module_init(uvc_teaming_init);
-module_exit(uvc_teaming_exit);
+module_init(uvc_stitcher_init);
+module_exit(uvc_stitcher_exit);

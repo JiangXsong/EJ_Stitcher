@@ -28,6 +28,7 @@
 #define STITCHER_MAX_OUT_BUFS 8
 #define STITCHER_SYNC_DRAIN_FRAMES 4
 #define STITCHER_SYNC_MAX_RETRIES 3
+#define STITCHER_SEQ_MISMATCH_THRESHOLD 2
 
 #define STITCHER_DEFAULT_VID 0x1E4E
 #define STITCHER_DEFAULT_PID_P 0x7301
@@ -1646,7 +1647,7 @@ static void stitcher_dma(struct uvc_stitcher *stitcher, u32 out_size)
 	struct vb2_buffer *out_vb;
 	struct vb2_v4l2_buffer *v4l2_vb;
 	unsigned long flags;
-	unsigned int idx0, idx1;
+	unsigned int idx0, idx1, offset;
 	u32 seq0 = 0, seq1 = 0;
 	ktime_t ts0 = 0, ts1 = 0;
 	int i, ret;
@@ -1731,12 +1732,22 @@ static void stitcher_dma(struct uvc_stitcher *stitcher, u32 out_size)
 			continue;
 		}
 		if (seq0 != seq1) {
-			pr_warn_ratelimited(
+            offset = (seq0 > seq1) ? (seq0 - seq1) : (seq1 - seq0);
+            if (offset > STITCHER_SEQ_MISMATCH_THRESHOLD) {
+                 pr_warn("uvc_stitcher: DQBUF sequence mismatch %u vs %u (offset %u), resyncing sources\n",
+                         seq0, seq1, offset);
+                 ret = stitcher_dmabuf_resync_sources(stitcher);
+                 if (ret) {
+                     pr_err("uvc_stitcher: failed to resync sources: %d\n", ret);
+                     break;
+                 }
+                 continue;
+            }
+
+			pr_info_ratelimited(
 				"uvc_stitcher: seq mismatch %u vs %u, "
-				"discarding pair idx %u\n",
-				seq0, seq1, idx0);
-			stitcher_requeue_pair_dmabuf(stitcher, idx0, idx1);
-			continue;
+				"offset %u\n",
+				seq0, seq1, offset);
 		}
 
 		/* Output buffer idx0 is filled by DMA — signal done */

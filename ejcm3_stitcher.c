@@ -1,4 +1,5 @@
 #include <linux/module.h>
+#include <linux/version.h>
 #include <linux/kthread.h>
 #include <linux/kallsyms.h>
 #include <linux/list.h>
@@ -190,7 +191,11 @@ MODULE_PARM_DESC(zerocopy,
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Syu-Song Chiang");
 MODULE_DESCRIPTION("UVC Stitcher: Stitching two UVC sources in kernel space");
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 13, 0)
 MODULE_IMPORT_NS("DMA_BUF");
+#else
+MODULE_IMPORT_NS(DMA_BUF);
+#endif
 
 /* ------------------------------------------------------------------ */
 /* Inline helpers                                                     */

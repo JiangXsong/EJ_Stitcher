@@ -74,6 +74,7 @@ struct stitcher_slot {
 	ktime_t cur_ts;
 	bool buf_ready;
 
+	struct usb_interface *intf;
 	struct usb_device *udev;
 };
 
@@ -890,8 +891,10 @@ static void stitcher_disc_work_fn(struct work_struct *w)
 			mutex_unlock(&stitcher->src_disc_lock);
 			goto out;
 		}
-		stitcher->src[slot].udev = interface_to_usbdev(
-			to_usb_interface(vdev->v4l2_dev->dev));
+		stitcher->src[slot].intf =
+			to_usb_interface(vdev->v4l2_dev->dev);
+		stitcher->src[slot].udev =
+			interface_to_usbdev(stitcher->src[slot].intf);
 
 		pr_info("uvc_stitcher: slot%d filled (%s), ready=%d/%d\n", slot,
 			devpath, stitcher->src_ready_count,
@@ -1288,6 +1291,26 @@ static int stitcher_uvc_start(struct uvc_stitcher *stitcher)
 		}
 	}
 
+	/*
+	 * Resume the UVC sources and hold a runtime-PM ref for the whole
+	 * streaming session.  On 6.17 uvcvideo no longer pins runtime PM
+	 * across open(), so a device opened at discovery time can autosuspend
+	 * before this point, making the PROBE control transfer in S_FMT fail
+	 * with -EHOSTUNREACH (-113).  Released by stitcher_uvc_stop() on the
+	 * success path or by err_out below on failure.
+	 */
+	for (i = 0; i < STITCHER_NUM_SOURCES; i++) {
+		ret = usb_autopm_get_interface(stitcher->src[i].intf);
+		if (ret) {
+			pr_err("uvc_stitcher: autopm_get src%d failed: %d\n",
+			       i, ret);
+			while (i--)
+				usb_autopm_put_interface(stitcher->src[i].intf);
+			mutex_unlock(&stitcher->uvc_ctrl_lock);
+			return ret;
+		}
+	}
+
 	/* Negotiate format and framerate */
 	for (i = 0; i < STITCHER_NUM_SOURCES; i++) {
 		ret = stitcher_uvc_negotiate_src_fmt(stitcher, i);
@@ -1393,6 +1416,9 @@ err_dmabuf:
 	for (i = 0; i < STITCHER_NUM_SOURCES; i++)
 		stitcher_uvc_free_bufs(stitcher, i);
 err_out:
+	for (i = 0; i < STITCHER_NUM_SOURCES; i++)
+		if (stitcher->src[i].intf)
+			usb_autopm_put_interface(stitcher->src[i].intf);
 	mutex_unlock(&stitcher->uvc_ctrl_lock);
 	return ret;
 }
@@ -1427,6 +1453,15 @@ static void stitcher_uvc_stop(struct uvc_stitcher *stitcher)
 	/* Destroy dma_bufs. */
 	if (stitcher->use_dmabuf)
 		stitcher_dmabuf_teardown_all(stitcher);
+
+	/*
+	 * Release the runtime-PM ref taken in stitcher_uvc_start().
+	 * Reached only when streaming was 1 (cmpxchg above), i.e. after a
+	 * successful get, so this is always balanced.
+	 */
+	for (i = 0; i < STITCHER_NUM_SOURCES; i++)
+		if (stitcher->src[i].intf)
+			usb_autopm_put_interface(stitcher->src[i].intf);
 
 	pr_info("uvc_stitcher: pipeline stopped\n");
 }

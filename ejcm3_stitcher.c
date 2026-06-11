@@ -23,6 +23,33 @@
 #include <media/videobuf2-v4l2.h>
 #include <media/videobuf2-vmalloc.h>
 
+/* ------------------------------------------------------------------ */
+/* Kernel version compatibility shims                                 */
+/* ------------------------------------------------------------------ */
+/* iosys_map was renamed from dma_buf_map in v5.18 (commit 7938f4218168). */
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 18, 0)
+#define iosys_map		dma_buf_map
+#define iosys_map_set_vaddr	dma_buf_map_set_vaddr
+#endif
+
+/*
+ * v6.4 made struct class pointers const and dropped the class_interface*
+ * argument from the add_dev/remove_dev callbacks (Greg KH constify series).
+ */
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 4, 0)
+#define STITCHER_CLASS_CONST
+#else
+#define STITCHER_CLASS_CONST const
+#endif
+
+/* vb2_get_num_buffers() was added in v6.8; provide it for older kernels. */
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 8, 0)
+static inline unsigned int vb2_get_num_buffers(struct vb2_queue *q)
+{
+	return q->num_buffers;
+}
+#endif
+
 #define STITCHER_NUM_SOURCES 2
 #define STITCHER_SRC_NUM_BUFS 4
 #define STITCHER_OUT_NUM_BUFS 4
@@ -172,7 +199,7 @@ struct uvc_stitcher {
 static int stitcher_uvc_start(struct uvc_stitcher *stitcher);
 static void stitcher_uvc_stop(struct uvc_stitcher *stitcher);
 static int stitcher_register_class_intf(struct uvc_stitcher *stitcher,
-					const struct class *vcls);
+					STITCHER_CLASS_CONST struct class *vcls);
 static void stitcher_unregister_class_intf(struct uvc_stitcher *stitcher);
 static void stitcher_unregister(struct uvc_stitcher *stitcher);
 static int init_queue(struct stitcher_video_queue *q);
@@ -990,7 +1017,12 @@ static int stitcher_schedule_disc_work(struct uvc_stitcher *stitcher,
 	return 0;
 }
 
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 4, 0)
+static int stitcher_class_add_dev(struct device *dev,
+				  struct class_interface *ci)
+#else
 static int stitcher_class_add_dev(struct device *dev)
+#endif
 {
 	struct uvc_stitcher *stitcher = g_stitcher;
 	struct video_device *vdev = to_video_device(dev);
@@ -1004,7 +1036,12 @@ static int stitcher_class_add_dev(struct device *dev)
 	return stitcher_schedule_disc_work(stitcher, vdev, true);
 }
 
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 4, 0)
+static void stitcher_class_remove_dev(struct device *dev,
+				      struct class_interface *ci)
+#else
 static void stitcher_class_remove_dev(struct device *dev)
+#endif
 {
 	struct uvc_stitcher *stitcher = g_stitcher;
 	struct video_device *vdev = to_video_device(dev);
@@ -1030,7 +1067,7 @@ static void stitcher_class_remove_dev(struct device *dev)
 }
 
 static int stitcher_register_class_intf(struct uvc_stitcher *stitcher,
-					const struct class *vcls)
+					STITCHER_CLASS_CONST struct class *vcls)
 {
 	stitcher->class_intf.class = vcls;
 	stitcher->class_intf.add_dev = stitcher_class_add_dev;
@@ -1490,7 +1527,11 @@ static int stitcher_dqbuf_src_mmap(struct uvc_stitcher *stitcher, int slot)
 		return ret;
 	}
 
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 8, 0)
+	if (buf.index >= src->vbq->num_buffers) {
+#else
 	if (buf.index >= src->vbq->max_num_buffers) {
+#endif
 		pr_err("uvc_stitcher: src%d DQBUF got invalid buffer index %d\n",
 		       slot, buf.index);
 		return -EFAULT;
@@ -1690,7 +1731,7 @@ static void stitcher_dma(struct uvc_stitcher *stitcher, u32 out_size)
 	unsigned int idx0, idx1, offset;
 	u32 seq0 = 0, seq1 = 0;
 	ktime_t ts0 = 0, ts1 = 0;
-	int i, ret;
+	int i, ret, s;
 
 	/* create cached fds in init_files */
 	ret = stitcher_dmabuf_create_cached_fds(stitcher);
@@ -1727,7 +1768,7 @@ static void stitcher_dma(struct uvc_stitcher *stitcher, u32 out_size)
 			spin_unlock_irqrestore(&stitcher->out_q.irqlock, flags);
 
 			i = mbuf->buf.vb2_buf.index;
-			for (int s = 0; s < STITCHER_NUM_SOURCES; s++)
+			for (s = 0; s < STITCHER_NUM_SOURCES; s++)
 				stitcher_qbuf_src_dmabuf(
 					stitcher, s, i,
 					stitcher->dma_slots[i].cached_fd[s]);
@@ -2547,7 +2588,7 @@ static void stitcher_unregister(struct uvc_stitcher *stitcher)
 static int stitcher_add(void)
 {
 	struct uvc_stitcher *stitcher;
-	const struct class *vcls;
+	STITCHER_CLASS_CONST struct class *vcls;
 	int ret;
 
 	pr_info("uvc_stitcher: initializing stitcher...\n");

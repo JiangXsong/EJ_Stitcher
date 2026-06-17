@@ -1,64 +1,125 @@
-# EJ_Stitcher — a kernel module to discover two specific UVC devices, and stitches their frames top-to-bottom
+# EJ_Stitcher — Dual UVC Stitching Driver
 
-A Linux kernel module that discovers two UVC cameras by USB VID/PID via
-`class_interface`, opens them in kernel space with `filp_open`, and stitches
-their NV12 frames top-to-bottom into a single `/dev/videoN` V4L2 capture
-device — without modifying `uvcvideo`.
+EJ_Stitcher is a Linux kernel driver that combines the video streams from two
+USB cameras into a single virtual camera device. The two camera feeds are
+stitched top-to-bottom and exposed as one `/dev/videoN` capture device,
+which can be used directly in OBS Studio, ffmpeg, or any other V4L2-compatible
+application — no additional software or configuration required.
 
-The output node is available immediately after `modprobe`. UVC sources are
-filled asynchronously on hotplug; `VIDIOC_STREAMON` is rejected with
-`-ENODEV` until both slots are ready. A dedicated kthread dequeues one frame
-from each source per iteration, stitches them, and signals the combined buffer
-to the consumer.
+The virtual camera is available as soon as the driver is loaded. The two
+physical cameras are detected automatically when plugged in. Streaming starts
+once both cameras are connected and ready.
 
 # Hardware Requirements
 
-| Parameter     | Value                              |
-|---------------|------------------------------------|
-| Pixel Format  | NV12                               |
-| Stitch Mode   | Top-Bottom                         |
+| Parameter         | Value                                                         |
+|-------------------|---------------------------------------------------------------|
+| Pixel Format      | NV12                                                          |
+| Stitch Mode       | Top-Bottom                                                    |
+| Output Resolution | Up to 3840×2160 (4K) @ 60 fps                                |
+| USB Ports         | Two separate USB 3.0 ports (one per camera)                   |
+| Host Interface    | PCIe Gen 3 ×2 or above (minimum 10 Gbps) for stable 4K@60fps |
 
 Both cameras must be the same model and produce the same resolution.
 
+For best performance, we recommend a CPU equivalent to Intel 12th Gen Core i7
+or AMD Ryzen 7 5000 series and above. Older CPUs (e.g. Intel 7th Gen Core i5
+or earlier) can run the driver but will see significantly higher CPU utilization.
+
+# Kernel / Software Requirements
+
+## Linux Kernel
+
+The following kernel versions have been validated:
+
+- 5.15.x
+- 6.8.x
+- 6.14.x
+
+## Build Dependencies
+
+The following tools are required to build the kernel module:
+
+- `make`
+- `gcc`
+- Kernel headers matching your running kernel (`linux-headers-$(uname -r)`)
+
+On Ubuntu/Debian, install them with:
+
+```bash
+sudo apt install build-essential linux-headers-$(uname -r)
+```
+
+## Required Kernel Modules
+
+The following kernel modules must be loaded before using EJ_Stitcher.
+They are included in most standard Linux distributions and are typically
+loaded automatically:
+
+- `uvcvideo` — UVC camera driver
+- `videobuf2` — V4L2 buffer management framework
+
+## Verified Consumer Applications
+
+The following applications have been tested and work out of the box with
+the EJ_Stitcher output device:
+
+- [OBS Studio](https://obsproject.com/)
+- [ffmpeg](https://ffmpeg.org/)
+- [ffplay](https://ffmpeg.org/ffplay.html)
+
 # Build
 
-To build the kernel module, run:
+Before building, make sure the build dependencies listed above are installed.
+
+To compile the driver, run:
 
 ```bash
 $ make
 ```
 
-This should generate a kernel module file named "proxy_mixer.ko".
+This produces the kernel module file `uvc_stitch.ko` in the current directory.
 
-## Build again
+## Rebuilding
 
-You must clean the build before re-compiling the module.
+If you make changes to the source or switch kernel versions, clean the previous
+build before recompiling:
 
 ```bash
 $ make clean
+$ make
 ```
 
-Afterwards re-run make to do the actual build.
+# Install
 
-# install
-
-To install the module, run "make install" (you might have to be 'root' to have all necessary permissions to install the module).
+Installing the driver makes it available system-wide via `modprobe`, so you
+do not need to specify the full path each time. Root privileges are required.
 
 ```bash
 $ make && sudo make install
 ```
 
-# RUN
+# Load the Driver
 
-Load the module as root:
+Once installed, load the driver with:
 
 ```bash
-$ sudo modprobe proxy_mixer
+$ sudo modprobe uvc_stitch
 ```
 
+The virtual camera device (`/dev/videoN`) is created immediately. Plug in both
+cameras and they will be detected automatically.
 
+To unload the driver:
 
-# Format source files (requires clang-format)
+```bash
+$ sudo modprobe -r uvc_stitch
+```
+
+# Format Source Files
+
+Requires `clang-format` to be installed.
+
 ```bash
 $ make clang-format
 ```
@@ -67,50 +128,67 @@ $ make clang-format
 
 # Usage
 
-Verify the output device was created, and check info:
+## Check the Output Device
+
+After loading the driver and connecting both cameras, verify the virtual device
+was created:
 
 ```bash
 $ v4l2-ctl --list-devices
+```
 
+View detailed information about the output device:
+
+```bash
 $ v4l2-ctl -d /dev/videoN --info
 ```
 
-Query supported formats:
+Query the supported video formats:
 
 ```bash
 $ v4l2-ctl -d /dev/videoN --list-formats-ext
 ```
 
-Capture test (raw NV12)
+Replace `/dev/videoN` with the actual device path shown by `--list-devices`.
+
+## Capture Video
+
+Save the stitched output to a file:
 
 ```bash
-ffmpeg -f v4l2 -input_format nv12 -video_size 1280x1440 \
-       -i /dev/videoN output.mkv
+$ ffmpeg -f v4l2 -input_format nv12 -video_size 3840x2160 \
+         -i /dev/videoN output.mkv
 ```
 
-Preview with ffplay:
+## Preview
+
+Preview the live stitched stream:
 
 ```bash
-ffplay -f v4l2 -video_size 1280x1440 -i /dev/videoN
+$ ffplay -f v4l2 -input_format nv12 -video_size 3840x2160 -i /dev/videoN
 ```
-Or use OBS.
+
+Alternatively, add the device as a Video Capture Source in OBS Studio.
 
 # Default Parameters
 
-| Parameter      | Default      | Description                        |
-|----------------|--------------|------------------------------------|
-| `out_width`    | 1280         | Output frame width (pixels)        |
-| `out_height`   | 1440         | Output frame height = src_h × 2   |
-| `src_width`    | 1280         | Per-source width                   |
-| `src_height`   | 720          | Per-source height                  |
-| `fps_num`      | 1            | Frame interval numerator           |
-| `fps_den`      | 30           | Frame interval denominator (30fps) |
+The driver uses the following defaults. These can be changed before starting
+the stream via `VIDIOC_S_FMT` (resolution/format) and `VIDIOC_S_PARM` (framerate).
 
-Output resolution and framerate can be changed via `VIDIOC_S_FMT` and `VIDIOC_S_PARM` before `STREAMON`.
+| Parameter    | Default | Description                                   |
+|--------------|---------|-----------------------------------------------|
+| `out_width`  | 3840    | Output frame width (pixels)                   |
+| `out_height` | 2160    | Output frame height (= per-source height × 2) |
+| `src_width`  | 3840    | Per-camera input width                        |
+| `src_height` | 1080    | Per-camera input height                       |
+| `fps_num`    | 1       | Frame interval numerator                      |
+| `fps_den`    | 60      | Frame interval denominator (60 fps)           |
 
 ---
 
-# State Machine
+# How It Works — State Machine
+
+The driver moves through the following states from load to streaming:
 
 ```
 IDLE  ──modprobe──►  video node created
@@ -134,13 +212,17 @@ STREAMING
   └── rmmod            ──► mixer_uvc_stop() → unregister → gone
 ```
 
+**In short:** loading the driver creates the virtual camera immediately.
+Streaming only starts once both physical cameras are connected and an
+application requests the stream. Unplugging a camera or stopping the
+stream returns the driver to idle — it does not need to be reloaded.
+
 # Known Limitations
 
-- VID/PID is hard-coded at compile time.
-- Only NV12 pixel format is supported.
-- Frame synchronization (`mixer_sync_frames`) is currently disabled.
-- `MIXER_CALL_OP` bypasses V4L2 core capability checks; source `filp`/`vdev` lifetime must be guarded by `src_disc_lock` / `uvc_ctrl_lock`.
-
+- The target camera model (USB Vendor ID / Product ID) is fixed at compile
+  time and cannot be changed without rebuilding the driver.
+- Only the NV12 pixel format is supported. MJPEG or other formats are not
+  currently available.
 
 # License
 

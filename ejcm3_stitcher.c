@@ -2164,8 +2164,17 @@ const struct vb2_ops stitcher_vb2_ops = {
 	.buf_queue       = stitcher_buf_queue,
 	.start_streaming = stitcher_start_streaming,
 	.stop_streaming  = stitcher_stop_streaming,
+	/*
+	 * Since commit 88785982a19d ("media: vb2: use lock if
+	 * wait_prepare/finish are NULL") vb2 drops/retakes q->lock itself
+	 * while sleeping in DQBUF; the ops were later removed from
+	 * struct vb2_ops.  We always set q->lock, so they are only needed
+	 * on older kernels.
+	 */
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 13, 0)
 	.wait_prepare    = vb2_ops_wait_prepare,
 	.wait_finish     = vb2_ops_wait_finish,
+#endif
 	// clang-format on
 };
 
@@ -2549,7 +2558,7 @@ static void init_vdev(struct uvc_stitcher *stitcher)
 	/*
      * Use the output queue mutex as the vdev lock.  This serializes
      * all ioctls and — critically — allows STREAMOFF to preempt a
-     * blocking DQBUF: vb2's wait_prepare releases this lock while
+     * blocking DQBUF: vb2 releases q->lock (== vdev->lock) while
      * sleeping, so STREAMOFF can acquire it and cancel the queue.
      *
      * Without this, ffplay's SDL event loop cannot interrupt a
